@@ -1,0 +1,1 @@
+"""arXiv Translator backend package."""

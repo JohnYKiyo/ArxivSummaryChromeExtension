@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>arXiv Paper Translator</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="header">
+        <h1 class="title">arXiv Paper Translator</h1>
+        <p class="subtitle">論文を日本語に翻訳・要約</p>
+      </header>
+
+      <main class="main">
+        <!-- URL Input Section -->
+        <div class="input-group">
+          <label for="arxiv-url" class="label">arXiv URL</label>
+          <div class="input-row">
+            <input
+              id="arxiv-url"
+              type="url"
+              placeholder="https://arxiv.org/abs/2401.12345"
+              class="input"
+            />
+          </div>
+          <p id="url-hint" class="hint"></p>
+        </div>
+
+        <!-- Submit Button -->
+        <button id="submit-btn" class="btn btn-primary" disabled>
+          翻訳を開始
+        </button>
+
+        <!-- Progress Section -->
+        <div id="progress-section" class="progress-section hidden">
+          <div class="progress-header">
+            <span id="progress-label" class="progress-label">処理中...</span>
+            <span id="progress-percent" class="progress-percent">0%</span>
+          </div>
+          <div class="progress-bar-track">
+            <div id="progress-bar" class="progress-bar-fill"></div>
+          </div>
+          <p id="progress-step" class="progress-step"></p>
+        </div>
+
+        <!-- Download Section -->
+        <div id="download-section" class="download-section hidden">
+          <button id="download-btn" class="btn btn-success">
+            ダウンロード (ZIP)
+          </button>
+        </div>
+
+        <!-- Error Section -->
+        <div id="error-section" class="error-section hidden">
+          <p id="error-message" class="error-message"></p>
+          <button id="retry-btn" class="btn btn-outline">再試行</button>
+        </div>
+      </main>
+
+      <footer class="footer">
+        <button id="settings-toggle" class="settings-toggle">設定</button>
+        <div id="settings-panel" class="settings-panel hidden">
+          <label for="api-url" class="label">API Endpoint</label>
+          <input
+            id="api-url"
+            type="url"
+            placeholder="http://localhost:8000"
+            class="input input-sm"
+          />
+          <button id="save-settings" class="btn btn-outline btn-sm">保存</button>
+        </div>
+      </footer>
+    </div>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
