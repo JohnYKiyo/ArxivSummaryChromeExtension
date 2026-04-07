@@ -9,7 +9,6 @@ is skipped and a mock user is returned.
 """
 
 import logging
-from functools import lru_cache
 from typing import Any
 
 import httpx
