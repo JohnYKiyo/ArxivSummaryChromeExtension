@@ -30,9 +30,7 @@ logger = logging.getLogger(__name__)
 _job_manager: JobManager | None = None
 _event_bus: EventBus | None = None
 
-_ARXIV_URL_PATTERN = re.compile(
-    r"^https?://(www\.)?arxiv\.org/(abs|pdf|html)/\d{4}\.\d{4,5}(v\d+)?$"
-)
+_ARXIV_URL_PATTERN = re.compile(r"^https?://(www\.)?arxiv\.org/(abs|pdf|html)/\d{4}\.\d{4,5}(v\d+)?$")
 
 
 def init_routes(job_manager: JobManager, event_bus: EventBus) -> None:

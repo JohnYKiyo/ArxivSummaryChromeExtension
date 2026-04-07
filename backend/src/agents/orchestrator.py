@@ -227,11 +227,7 @@ async def run_pipeline(
         summary_agent = create_summary_agent(model)
         summary_ja = await _run_single_agent(
             summary_agent,
-            (
-                f"Create a summary for the following paper.\n"
-                f"arXiv URL: {arxiv_url}\n\n"
-                f"Paper content:\n{markdown_ja}"
-            ),
+            (f"Create a summary for the following paper.\narXiv URL: {arxiv_url}\n\nPaper content:\n{markdown_ja}"),
         )
         results["summary_ja"] = summary_ja
 
