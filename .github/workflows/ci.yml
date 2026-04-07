@@ -88,6 +88,9 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
+      - name: ESLint check
+        run: npm run lint
+
   frontend-build:
     name: Frontend Build
     runs-on: ubuntu-latest
