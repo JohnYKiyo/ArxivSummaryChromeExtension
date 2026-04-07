@@ -59,7 +59,7 @@ class StorageStack(Stack):
             lifecycle_rules=[
                 s3.LifecycleRule(
                     id="DeleteAfterOneHour",
-                    expiration=Duration.hours(1),
+                    expiration=Duration.days(1),
                     enabled=True,
                 ),
             ],
