@@ -1,0 +1,56 @@
+name: Lint Auto Fix
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+
+permissions:
+  contents: write
+
+jobs:
+  lint-fix:
+    name: Lint Auto Fix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Ruff
+        run: pip install ruff
+
+      - name: Ruff lint auto-fix
+        working-directory: backend
+        run: ruff check --fix src/ || true
+
+      - name: Ruff format
+        working-directory: backend
+        run: ruff format src/
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install frontend dependencies
+        working-directory: frontend/web
+        run: npm ci
+
+      - name: ESLint auto-fix
+        working-directory: frontend/web
+        run: npx eslint . --fix || true
+
+      - name: Commit lint fixes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "style: auto-fix lint issues"
+          branch: ${{ github.head_ref }}

@@ -5,10 +5,10 @@
  * Coordinates state between UrlInput, ProgressView, and DownloadButton components.
  */
 
-import { useState, useCallback, useEffect } from "react";
-import UrlInput from "./components/UrlInput";
-import ProgressView from "./components/ProgressView";
+import { useCallback, useEffect, useState } from "react";
 import DownloadButton from "./components/DownloadButton";
+import ProgressView from "./components/ProgressView";
+import UrlInput from "./components/UrlInput";
 import { useSSE } from "./hooks/useSSE";
 import { submitUrl } from "./services/api";
 
