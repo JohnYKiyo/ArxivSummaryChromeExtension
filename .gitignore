@@ -1,48 +1,103 @@
+# ============================================================
 # Python
+# ============================================================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 *.egg-info/
 *.egg
-dist/
-build/
 .eggs/
+*.whl
+*.pyz
+*.pyzw
+
+# Virtual environments
 .venv/
 venv/
 env/
-*.whl
+ENV/
 
-# Node
-node_modules/
+# Distribution / packaging
 dist/
+build/
+sdist/
+wheels/
+pip-wheel-metadata/
+
+# Testing / Quality
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ============================================================
+# Node.js / Frontend
+# ============================================================
+node_modules/
 .cache/
 *.tsbuildinfo
+.turbo/
+.next/
+.nuxt/
 
-# Environment
+# Vite
+frontend/web/dist/
+
+# Chrome Extension compiled output
+frontend/chrome-extension/popup/popup.js
+frontend/chrome-extension/content/content.js
+frontend/chrome-extension/background/service-worker.js
+
+# ============================================================
+# Environment / Secrets
+# ============================================================
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
-# IDE
+# ============================================================
+# IDE / Editor
+# ============================================================
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+*.sublime-project
+*.sublime-workspace
+
+# ============================================================
+# OS
+# ============================================================
 .DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
 
-# Testing
-.coverage
-htmlcov/
-.pytest_cache/
-.mypy_cache/
+# ============================================================
+# Docker
+# ============================================================
+docker-compose.override.yml
 
-# Build artifacts
+# ============================================================
+# AWS CDK
+# ============================================================
+infrastructure/cdk/cdk.out/
+infrastructure/cdk/.cdk.staging/
+
+# ============================================================
+# Build artifacts / Temp files
+# ============================================================
 *.zip
 *.tar.gz
-
-# Chrome extension build
-frontend/chrome-extension/popup/popup.js
-frontend/chrome-extension/content/content.js
-frontend/chrome-extension/background/service-worker.js
+*.log
+tmp/
+temp/

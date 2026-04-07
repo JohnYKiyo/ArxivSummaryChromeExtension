@@ -34,8 +34,12 @@ dev = [
 target-version = "py312"
 line-length = 120
 
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "A", "SIM"]
+ignore = ["B008"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

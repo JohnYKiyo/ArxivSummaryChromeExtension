@@ -6,8 +6,8 @@ and registers API route handlers for the arXiv Translator service.
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager, suppress
 
 import uvicorn
 from fastapi import FastAPI
@@ -69,10 +69,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     # Shutdown
     if _cleanup_task is not None:
         _cleanup_task.cancel()
-        try:
+        with suppress(asyncio.CancelledError):
             await _cleanup_task
-        except asyncio.CancelledError:
-            pass
     logger.info("arXiv Translator shut down")
 
 
