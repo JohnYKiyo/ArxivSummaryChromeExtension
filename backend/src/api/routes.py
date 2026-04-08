@@ -9,16 +9,16 @@ Defines the following endpoints:
 
 import asyncio
 import logging
-import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, field_validator
 from sse_starlette.sse import EventSourceResponse
 
 from src.api.auth import get_current_user
-from src.services.job_manager import JobManager, JobStatus
+from src.models.api import ConvertRequest, ConvertResponse, ErrorResponse, HealthResponse
+from src.models.job import JobStatus
+from src.services.job_manager import JobManager
 from src.services.sse import EventBus
 
 logger = logging.getLogger(__name__)
@@ -29,8 +29,6 @@ logger = logging.getLogger(__name__)
 
 _job_manager: JobManager | None = None
 _event_bus: EventBus | None = None
-
-_ARXIV_URL_PATTERN = re.compile(r"^https?://(www\.)?arxiv\.org/(abs|pdf|html)/\d{4}\.\d{4,5}(v\d+)?$")
 
 
 def init_routes(job_manager: JobManager, event_bus: EventBus) -> None:
@@ -59,46 +57,6 @@ def _get_event_bus() -> EventBus:
     if _event_bus is None:
         raise RuntimeError("EventBus not initialized; call init_routes first")
     return _event_bus
-
-
-# ---------------------------------------------------------------------------
-# Request / Response models
-# ---------------------------------------------------------------------------
-
-
-class ConvertRequest(BaseModel):
-    """Request body for the ``POST /convert`` endpoint."""
-
-    arxiv_url: str
-
-    @field_validator("arxiv_url")
-    @classmethod
-    def validate_arxiv_url(cls, v: str) -> str:
-        if not _ARXIV_URL_PATTERN.match(v):
-            msg = "Invalid arXiv URL. Expected format: https://arxiv.org/abs/YYMM.NNNNN"
-            raise ValueError(msg)
-        return v
-
-
-class ConvertResponse(BaseModel):
-    """Response body for a successfully accepted conversion job."""
-
-    job_id: str
-    status: str
-    stream_url: str
-
-
-class HealthResponse(BaseModel):
-    """Response body for the health check endpoint."""
-
-    status: str
-    version: str
-
-
-class ErrorResponse(BaseModel):
-    """Standard error response body."""
-
-    detail: str
 
 
 # ---------------------------------------------------------------------------

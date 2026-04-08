@@ -23,8 +23,8 @@ from src.agents.tex2markdown import create_tex2markdown_agent
 from src.agents.tex_fetch import create_tex_fetch_agent
 from src.agents.translation import create_translation_agent
 from src.config import get_settings
-from src.services.job_manager import JobStatus
-from src.services.sse import SSEEvent
+from src.models.job import JobStatus
+from src.models.sse_event import SSEEvent
 from src.tools.arxiv import fetch_arxiv_paper
 from src.tools.packaging import create_zip_package
 

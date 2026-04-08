@@ -5,7 +5,7 @@
  * Shows each pipeline stage with status indicators and a progress bar.
  */
 
-import type { StepName } from "../hooks/useSSE";
+import type { StepName } from "../types";
 
 interface ProgressViewProps {
   currentStep: StepName | null;

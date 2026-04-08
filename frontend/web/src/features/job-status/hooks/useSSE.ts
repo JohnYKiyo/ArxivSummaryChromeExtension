@@ -7,30 +7,9 @@
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
+
 import { getStreamUrl, getDownloadUrl } from "../services/api";
-
-export type StepName =
-  | "tex_fetch"
-  | "tex2markdown"
-  | "translation"
-  | "summary"
-  | "packaging";
-
-export interface ProgressEvent {
-  step: StepName;
-  progress: number;
-  message: string;
-}
-
-interface SSEState {
-  events: ProgressEvent[];
-  currentStep: StepName | null;
-  progress: number;
-  isComplete: boolean;
-  isError: boolean;
-  errorMessage: string | null;
-  downloadUrl: string | null;
-}
+import type { ProgressEvent, SSEState } from "../types";
 
 const INITIAL_STATE: SSEState = {
   events: [],

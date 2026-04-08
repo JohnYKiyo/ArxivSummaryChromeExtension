@@ -22,7 +22,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, HttpUrl
 
-from src.services.job_manager import JobManager, JobStatus
+from src.models.job import JobStatus
+from src.services.job_manager import JobManager
 
 # ---------------------------------------------------------------------------
 # Minimal app for testing expected route behaviour
