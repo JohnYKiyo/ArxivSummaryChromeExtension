@@ -4,9 +4,7 @@ import re
 
 from pydantic import BaseModel, field_validator
 
-_ARXIV_URL_PATTERN = re.compile(
-    r"^https?://(www\.)?arxiv\.org/(abs|pdf|html)/\d{4}\.\d{4,5}(v\d+)?$"
-)
+_ARXIV_URL_PATTERN = re.compile(r"^https?://(www\.)?arxiv\.org/(abs|pdf|html)/\d{4}\.\d{4,5}(v\d+)?$")
 
 
 class ConvertRequest(BaseModel):
