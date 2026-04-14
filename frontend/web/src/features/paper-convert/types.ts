@@ -1,4 +1,4 @@
 export interface SubmitResponse {
   job_id: string;
-  stream_url: string;
+  status_url: string;
 }

@@ -2,12 +2,20 @@
  * Job status API client.
  */
 
-import { BASE_URL } from "../../../shared/services/api";
+import { BASE_URL, getHeaders } from "../../../shared/services/api";
+import type { StatusResponse } from "../types";
 
-export function getDownloadUrl(jobId: string): string {
-  return `${BASE_URL}/api/v1/jobs/${jobId}/download`;
-}
+export async function fetchJobStatus(
+  jobId: string,
+): Promise<StatusResponse> {
+  const response = await fetch(`${BASE_URL}/api/v1/jobs/${jobId}/status`, {
+    headers: getHeaders(),
+  });
 
-export function getStreamUrl(jobId: string): string {
-  return `${BASE_URL}/api/v1/jobs/${jobId}/stream`;
+  if (!response.ok) {
+    throw new Error(`Status fetch failed: ${response.status}`);
+  }
+
+  const data: unknown = await response.json();
+  return data as StatusResponse;
 }

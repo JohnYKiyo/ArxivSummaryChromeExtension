@@ -9,13 +9,9 @@ Provides common test fixtures including:
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import patch
-
 import pytest
 
 from src.services.job_manager import JobManager
-from src.services.sse import EventBus
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +28,7 @@ def settings_override(monkeypatch: pytest.MonkeyPatch):
         "COGNITO_USER_POOL_ID": "us-east-1_TestPool",
         "COGNITO_APP_CLIENT_ID": "test-client-id",
         "S3_BUCKET_NAME": "test-bucket",
+        "DYNAMODB_TABLE_NAME": "test-arxiv-translator-jobs",
         "APP_ENV": "test",
         "LOG_LEVEL": "DEBUG",
         "CORS_ORIGINS": "http://localhost:3000",
@@ -222,11 +219,12 @@ def sample_markdown_ja() -> str:
 
 @pytest.fixture()
 def job_manager() -> JobManager:
-    """Return a fresh JobManager instance for testing."""
-    return JobManager()
+    """Return a fresh JobManager instance for testing.
 
-
-@pytest.fixture()
-def event_bus() -> EventBus:
-    """Return a fresh EventBus instance for testing."""
-    return EventBus()
+    Uses DynamoDB Local if available, otherwise tests requiring
+    this fixture should be run with a local DynamoDB instance.
+    """
+    return JobManager(
+        table_name="test-arxiv-translator-jobs",
+        endpoint_url="http://localhost:8100",
+    )

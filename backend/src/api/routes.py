@@ -2,24 +2,21 @@
 
 Defines the following endpoints:
 - POST /api/v1/convert - Create a new conversion job
-- GET /api/v1/jobs/{job_id}/stream - SSE progress stream
-- GET /api/v1/jobs/{job_id}/download - Download ZIP result
+- GET /api/v1/jobs/{job_id}/status - Poll job progress
 - GET /api/v1/health - Health check
 """
 
-import asyncio
+import json
 import logging
 from typing import Any
 
+import boto3
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import FileResponse
-from sse_starlette.sse import EventSourceResponse
 
 from src.api.auth import get_current_user
-from src.models.api import ConvertRequest, ConvertResponse, ErrorResponse, HealthResponse
-from src.models.job import JobStatus
+from src.config import get_settings
+from src.models.api import ConvertRequest, ConvertResponse, ErrorResponse, HealthResponse, StatusResponse
 from src.services.job_manager import JobManager
-from src.services.sse import EventBus
 
 logger = logging.getLogger(__name__)
 
@@ -28,21 +25,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _job_manager: JobManager | None = None
-_event_bus: EventBus | None = None
 
 
-def init_routes(job_manager: JobManager, event_bus: EventBus) -> None:
+def init_routes(job_manager: JobManager) -> None:
     """Inject shared service instances into the routes module.
 
     Called once during application startup from ``main.py``.
 
     Args:
         job_manager: The application-wide :class:`JobManager`.
-        event_bus: The application-wide :class:`EventBus`.
     """
-    global _job_manager, _event_bus  # noqa: PLW0603
+    global _job_manager  # noqa: PLW0603
     _job_manager = job_manager
-    _event_bus = event_bus
 
 
 def _get_job_manager() -> JobManager:
@@ -50,13 +44,6 @@ def _get_job_manager() -> JobManager:
     if _job_manager is None:
         raise RuntimeError("JobManager not initialized; call init_routes first")
     return _job_manager
-
-
-def _get_event_bus() -> EventBus:
-    """Return the shared EventBus, raising if not initialized."""
-    if _event_bus is None:
-        raise RuntimeError("EventBus not initialized; call init_routes first")
-    return _event_bus
 
 
 # ---------------------------------------------------------------------------
@@ -78,27 +65,39 @@ async def create_conversion(
 ) -> ConvertResponse:
     """Create a new arXiv paper conversion job.
 
-    Validates the URL, creates a job record, and launches the
-    translation pipeline as a background task.
+    Validates the URL, creates a job record in DynamoDB, and invokes
+    the pipeline Lambda asynchronously.
 
-    Returns 202 Accepted with the job ID and SSE stream URL.
+    Returns 202 Accepted with the job ID and status polling URL.
     """
     job_manager = _get_job_manager()
-    event_bus = _get_event_bus()
+    settings = get_settings()
 
     job = await job_manager.create_job(body.arxiv_url)
 
-    # Import here to avoid circular imports at module level.
-    from src.agents.orchestrator import run_pipeline
+    if settings.PIPELINE_LAMBDA_NAME:
+        # Production: invoke pipeline Lambda asynchronously
+        lambda_client = boto3.client("lambda")
+        lambda_client.invoke(
+            FunctionName=settings.PIPELINE_LAMBDA_NAME,
+            InvocationType="Event",
+            Payload=json.dumps({"job_id": job.job_id, "arxiv_url": body.arxiv_url}),
+        )
+        logger.info("Invoked pipeline Lambda for job %s", job.job_id)
+    else:
+        # Local development: run pipeline in background task
+        import asyncio
 
-    asyncio.create_task(
-        _run_pipeline_task(job.job_id, body.arxiv_url, job_manager, event_bus, run_pipeline),
-    )
+        from src.agents.orchestrator import run_pipeline
+
+        asyncio.create_task(
+            _run_pipeline_task(job.job_id, body.arxiv_url, job_manager, run_pipeline),
+        )
 
     return ConvertResponse(
         job_id=job.job_id,
         status="accepted",
-        stream_url=f"/api/v1/jobs/{job.job_id}/stream",
+        status_url=f"/api/v1/jobs/{job.job_id}/status",
     )
 
 
@@ -106,74 +105,37 @@ async def _run_pipeline_task(
     job_id: str,
     arxiv_url: str,
     job_manager: JobManager,
-    event_bus: EventBus,
     run_pipeline: Any,
 ) -> None:
     """Wrapper that runs the pipeline and handles final cleanup.
 
-    The orchestrator's ``run_pipeline`` already manages job status
-    updates, SSE events, and event bus cleanup internally.
-    This wrapper only catches unexpected errors that escape the
-    orchestrator's own error handling.
+    Used only in local development mode when no pipeline Lambda is configured.
     """
     try:
         await run_pipeline(
             arxiv_url=arxiv_url,
             job_id=job_id,
-            event_bus=event_bus,
             job_manager=job_manager,
         )
     except Exception:
         logger.exception("Pipeline task failed for job %s", job_id)
-        # Orchestrator should have already handled this, but just in case
         job = await job_manager.get_job(job_id)
-        if job and job.status != JobStatus.ERROR:
+        if job and job.status != "error":
             await job_manager.set_error(job_id, "Pipeline execution failed")
 
 
-@router.get("/jobs/{job_id}/stream")
-async def stream_job_progress(
-    job_id: str,
-    _user: dict[str, Any] = Depends(get_current_user),
-) -> EventSourceResponse:
-    """Stream real-time progress events for a conversion job via SSE.
-
-    The stream terminates when the job reaches a terminal state
-    (completed or error) or the client disconnects.
-    """
-    job_manager = _get_job_manager()
-    event_bus = _get_event_bus()
-
-    job = await job_manager.get_job(job_id)
-    if job is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job not found: {job_id}",
-        )
-
-    async def event_generator():  # noqa: ANN202
-        async for event in event_bus.subscribe(job_id):
-            yield {
-                "event": event.event,
-                "data": event.to_sse_string().split("data: ", 1)[1].split("\n")[0],
-            }
-
-    return EventSourceResponse(event_generator())
-
-
 @router.get(
-    "/jobs/{job_id}/download",
-    responses={
-        404: {"model": ErrorResponse},
-    },
+    "/jobs/{job_id}/status",
+    response_model=StatusResponse,
+    responses={404: {"model": ErrorResponse}},
 )
-async def download_job_result(
+async def get_job_status(
     job_id: str,
     _user: dict[str, Any] = Depends(get_current_user),
-) -> FileResponse:
-    """Download the ZIP result of a completed conversion job.
+) -> StatusResponse:
+    """Poll the current status of a conversion job.
 
-    Returns 404 if the job does not exist or has not completed.
+    Returns the job's progress, current step, and download URL when complete.
     """
     job_manager = _get_job_manager()
 
@@ -184,23 +146,14 @@ async def download_job_result(
             detail=f"Job not found: {job_id}",
         )
 
-    if job.status != JobStatus.COMPLETED or job.result is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job {job_id} has not completed yet or has no result",
-        )
-
-    result_path = job.result
-    if not result_path.exists():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Result file no longer available",
-        )
-
-    return FileResponse(
-        path=result_path,
-        media_type="application/zip",
-        filename=result_path.name,
+    return StatusResponse(
+        job_id=job.job_id,
+        status=job.status,
+        current_step=job.current_step,
+        progress=job.progress,
+        message=job.message,
+        error=job.error,
+        download_url=job.download_url,
     )
 
 

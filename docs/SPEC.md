@@ -13,17 +13,18 @@ arXiv Translator は、arXiv 論文の URL を入力として受け取り、TeX 
 
 ### 2.2 バックエンド
 
-- **言語/フレームワーク**: Python 3.12+ / FastAPI
+- **言語/フレームワーク**: Python 3.12+ / FastAPI (Mangum 経由で Lambda 上で実行)
 - **AI エージェント**: Google ADK (Agent Development Kit)
 - **LLM**: Gemini
 
 ### 2.3 インフラストラクチャ (AWS)
 
-- **コンピューティング**: ECS Fargate
+- **コンピューティング**: Lambda (API ハンドラー + パイプライン実行)
+- **API ゲートウェイ**: HTTP API (API Gateway v2)
 - **CDN / 静的ホスティング**: CloudFront + S3
-- **ロードバランサー**: ALB（API Gateway は SSE の 29 秒制限のため不採用）
 - **認証**: Cognito
-- **データベース**: 不要（ジョブはインメモリ管理）
+- **ジョブ状態管理**: DynamoDB (TTL による自動クリーンアップ)
+- **一時ファイルストレージ**: S3 (ZIP 出力、1時間 TTL)
 
 ## 3. API エンドポイント
 
@@ -44,37 +45,51 @@ arXiv 論文の変換ジョブを作成します。
 ```json
 {
   "job_id": "uuid-string",
-  "stream_url": "/api/v1/jobs/{job_id}/stream"
+  "status": "accepted",
+  "status_url": "/api/v1/jobs/{job_id}/status"
 }
 ```
 
-### 3.2 GET /api/v1/jobs/{job_id}/stream
+### 3.2 GET /api/v1/jobs/{job_id}/status
 
-SSE (Server-Sent Events) による進捗イベントのストリーミング。
+ジョブの進捗状況をポーリングで取得します。フロントエンドは 3 秒間隔でこのエンドポイントをポーリングし、進捗を表示します。
 
-**イベントフロー:**
+**レスポンス:**
 
-```
-tex_fetch → tex2markdown → translation → summary → packaging → complete
-```
-
-**イベント形式:**
-
-```
-event: progress
-data: {"stage": "tex_fetch", "status": "running", "progress": 0.3, "message": "TeXソースをダウンロード中..."}
-
-event: progress
-data: {"stage": "complete", "status": "done", "progress": 1.0, "download_url": "/api/v1/jobs/{job_id}/download"}
+```json
+{
+  "job_id": "uuid-string",
+  "status": "translation",
+  "current_step": "translation",
+  "progress": 60,
+  "message": "日本語翻訳中...",
+  "error": null,
+  "download_url": null
+}
 ```
 
-### 3.3 GET /api/v1/jobs/{job_id}/download
+**完了時:**
 
-変換結果の ZIP ファイルをダウンロードします。
+```json
+{
+  "job_id": "uuid-string",
+  "status": "completed",
+  "current_step": "done",
+  "progress": 100,
+  "message": "処理が完了しました",
+  "error": null,
+  "download_url": "https://s3.amazonaws.com/..."
+}
+```
 
-**レスポンス:** `application/zip`
+**ステータス遷移:**
 
-### 3.4 GET /api/v1/health
+```
+accepted → tex_fetch → tex2markdown → translation → summary → packaging → completed
+                                                                              or error
+```
+
+### 3.3 GET /api/v1/health
 
 ヘルスチェックエンドポイント。
 
@@ -93,7 +108,7 @@ Google ADK を使用し、すべてのエージェントは AgentTool として�
 
 ### 4.1 OrchestratorAgent
 
-パイプライン全体を制御するシーケンシャルコントローラー。各エージェントを順次呼び出し、進捗状況を SSE 経由で報告します。
+パイプライン全体を制御するシーケンシャルコントローラー。各エージェントを順次呼び出し、進捗状況を DynamoDB に書き込みます。
 
 ### 4.2 TexFetchAgent
 
@@ -173,7 +188,8 @@ ArxivSummaryChromeExtension/
 │   ├── .env.example
 │   ├── src/
 │   │   ├── __init__.py
-│   │   ├── main.py
+│   │   ├── main.py                  # FastAPI app + Mangum Lambda handler
+│   │   ├── pipeline_handler.py      # Pipeline Lambda handler
 │   │   ├── config.py
 │   │   ├── api/
 │   │   │   ├── __init__.py
@@ -192,8 +208,7 @@ ArxivSummaryChromeExtension/
 │   │   │   └── packaging.py
 │   │   └── services/
 │   │       ├── __init__.py
-│   │       ├── job_manager.py
-│   │       └── sse.py
+│   │       └── job_manager.py       # DynamoDB-backed job state
 │   └── tests/
 │       ├── __init__.py
 │       ├── conftest.py
@@ -218,17 +233,14 @@ ArxivSummaryChromeExtension/
 │   │   ├── tsconfig.json
 │   │   ├── index.html
 │   │   └── src/
-│   │       ├── App.tsx
-│   │       ├── main.tsx
-│   │       ├── components/
-│   │       │   ├── UrlInput.tsx
-│   │       │   ├── ProgressView.tsx
-│   │       │   └── DownloadButton.tsx
-│   │       ├── hooks/
-│   │       │   └── useSSE.ts
-│   │       └── services/
-│   │           ├── api.ts
-│   │           └── auth.ts
+│   │       ├── features/
+│   │       │   ├── paper-convert/
+│   │       │   └── job-status/
+│   │       │       └── hooks/
+│   │       │           └── useJobPolling.ts
+│   │       ├── shared/
+│   │       ├── pages/
+│   │       └── app/
 │   └── chrome-extension/
 │       ├── manifest.json
 │       ├── popup/
@@ -240,7 +252,13 @@ ArxivSummaryChromeExtension/
 │       └── background/
 │           └── service-worker.ts
 ├── infrastructure/
-│   └── README.md
+│   ├── deploy.sh
+│   └── cdk/
+│       ├── app.py
+│       └── stacks/
+│           ├── auth_stack.py
+│           ├── backend_stack.py
+│           └── storage_stack.py
 ├── .gitignore
 ├── .env.example
 └── README.md
@@ -252,46 +270,58 @@ ArxivSummaryChromeExtension/
 sequenceDiagram
     actor User
     participant FE as Frontend (Web/Extension)
-    participant API as FastAPI Backend
-    participant Orch as OrchestratorAgent
+    participant APIGW as API Gateway
+    participant ApiLambda as API Lambda
+    participant DDB as DynamoDB
+    participant PipeLambda as Pipeline Lambda
     participant TF as TexFetchAgent
     participant T2M as Tex2MarkdownAgent
     participant TR as TranslationAgent
     participant SM as SummaryAgent
     participant ArXiv as arxiv.org
+    participant S3 as S3
 
     User->>FE: arXiv URL を入力
-    FE->>API: POST /api/v1/convert {arxiv_url}
-    API-->>FE: 202 {job_id, stream_url}
-    FE->>API: GET /api/v1/jobs/{job_id}/stream (SSE)
+    FE->>APIGW: POST /api/v1/convert {arxiv_url}
+    APIGW->>ApiLambda: リクエスト転送
+    ApiLambda->>DDB: ジョブ作成 (status=accepted)
+    ApiLambda->>PipeLambda: 非同期 invoke (Event)
+    ApiLambda-->>FE: 202 {job_id, status_url}
 
-    API->>Orch: ジョブ開始
-    Orch->>TF: TeX ソース取得
+    FE->>APIGW: GET /api/v1/jobs/{job_id}/status (3秒ごとポーリング)
+    APIGW->>ApiLambda: リクエスト転送
+    ApiLambda->>DDB: ジョブ状態取得
+    ApiLambda-->>FE: {status, progress, current_step, message}
+
+    PipeLambda->>DDB: status=tex_fetch
+    PipeLambda->>TF: TeX ソース取得
     TF->>ArXiv: tar.gz ダウンロード
     ArXiv-->>TF: ソースファイル
-    TF-->>Orch: .tex + images
-    Orch-->>API: SSE: tex_fetch complete
+    TF-->>PipeLambda: .tex + images
 
-    Orch->>T2M: TeX → Markdown 変換
-    T2M-->>Orch: paper_en.md
-    Orch-->>API: SSE: tex2markdown complete
+    PipeLambda->>DDB: status=tex2markdown
+    PipeLambda->>T2M: TeX → Markdown 変換
+    T2M-->>PipeLambda: paper_en.md
 
-    Orch->>TR: 英語 → 日本語翻訳
-    TR-->>Orch: paper_ja.md
-    Orch-->>API: SSE: translation complete
+    PipeLambda->>DDB: status=translation
+    PipeLambda->>TR: 英語 → 日本語翻訳
+    TR-->>PipeLambda: paper_ja.md
 
-    Orch->>SM: 要約生成
+    PipeLambda->>DDB: status=summary
+    PipeLambda->>SM: 要約生成
     SM->>SM: 論文タイプ判定
-    SM-->>Orch: summary_ja.md
-    Orch-->>API: SSE: summary complete
+    SM-->>PipeLambda: summary_ja.md
 
-    Orch->>Orch: ZIP パッケージング
-    Orch-->>API: SSE: packaging complete
-    API-->>FE: SSE: complete {download_url}
+    PipeLambda->>DDB: status=packaging
+    PipeLambda->>S3: ZIP アップロード
+    PipeLambda->>DDB: status=completed, download_url=presigned_url
+
+    FE->>APIGW: GET /api/v1/jobs/{job_id}/status (ポーリング)
+    ApiLambda-->>FE: {status=completed, download_url}
 
     User->>FE: ダウンロードボタンクリック
-    FE->>API: GET /api/v1/jobs/{job_id}/download
-    API-->>FE: ZIP ファイル
+    FE->>S3: Presigned URL でダウンロード
+    S3-->>FE: ZIP ファイル
 ```
 
 ## 8. Chrome 拡張機能の動作
@@ -306,8 +336,8 @@ Chrome 拡張機能は arxiv.org のページにコンテンツスクリプト�
 2. コンテンツスクリプトがページに「翻訳・要約」ボタンを挿入
 3. ボタンクリックで拡張機能のポップアップが開き、現在の論文 URL が自動入力される
 4. ユーザーが変換を開始すると、バックエンド API に変換リクエストを送信
-5. SSE で進捗状況をポップアップ内に表示
-6. 完了後、ZIP ファイルのダウンロードリンクを表示
+5. ポーリングで進捗状況をポップアップ内に表示
+6. 完了後、S3 presigned URL 経由で ZIP ファイルをダウンロード
 
 ### 8.3 権限
 
@@ -320,13 +350,20 @@ Chrome 拡張機能は arxiv.org のページにコンテンツスクリプト�
 ```env
 # LLM
 GOOGLE_API_KEY=your-google-api-key
-LLM_MODEL=gemini-2.0-flash
+LLM_MODEL=gemini-2.5-pro-preview-05-06
 
 # AWS
 AWS_REGION=ap-northeast-1
 COGNITO_USER_POOL_ID=ap-northeast-1_xxxxxxxxx
 COGNITO_APP_CLIENT_ID=xxxxxxxxxxxxxxxxxxxxxxxxxx
 S3_BUCKET_NAME=arxiv-translator-output
+
+# DynamoDB
+DYNAMODB_TABLE_NAME=arxiv-translator-jobs
+DYNAMODB_ENDPOINT_URL=             # ローカル開発時のみ設定
+
+# Lambda
+PIPELINE_LAMBDA_NAME=arxiv-translator-pipeline  # ローカル開発時は空
 
 # App
 APP_ENV=development
@@ -339,12 +376,12 @@ CORS_ORIGINS=http://localhost:5173
 ### 10.1 パフォーマンス
 
 - 論文1本あたりの処理時間: 目標 3 分以内
-- SSE によるリアルタイム進捗表示で体感待ち時間を軽減
+- ポーリング（3秒間隔）による進捗表示で体感待ち時間を軽減
 
 ### 10.2 スケーラビリティ
 
-- ECS Fargate によるオートスケーリング
-- ステートレス設計（ジョブ状態はインメモリ、永続化不要）
+- Lambda による自動スケーリング（同時実行数で制御）
+- DynamoDB のオンデマンドキャパシティで読み書きスケーリング
 
 ### 10.3 セキュリティ
 
@@ -352,12 +389,14 @@ CORS_ORIGINS=http://localhost:5173
 - CORS 設定による API アクセス制御
 - 環境変数による秘密情報管理
 - HTTPS 必須
+- S3 presigned URL による時限付きダウンロード
 
-### 10.4 可用性
+### 10.4 コスト
 
-- ヘルスチェックエンドポイントによる監視
-- ALB による負荷分散
-- CloudFront による静的アセット配信
+- サーバーレス構成により、使用時のみ課金
+- DynamoDB TTL による自動データ削除
+- S3 ライフサイクルポリシーによる ZIP ファイルの自動削除
+- 月額推定: 低利用時 $1 未満
 
 ### 10.5 保守性
 

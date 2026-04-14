@@ -2,9 +2,9 @@
 
 Coordinates the execution of all agents in the translation pipeline:
 TexFetchAgent -> Tex2MarkdownAgent -> TranslationAgent -> SummaryAgent.
-Reports progress via SSE events at each stage transition.
+Reports progress via DynamoDB updates at each stage transition.
 Implemented as a Google ADK SequentialAgent with sub-agents, plus a
-``run_pipeline`` helper for programmatic invocation with SSE support.
+``run_pipeline`` helper for programmatic invocation with progress tracking.
 """
 
 from __future__ import annotations
@@ -24,18 +24,16 @@ from src.agents.tex_fetch import create_tex_fetch_agent
 from src.agents.translation import create_translation_agent
 from src.config import get_settings
 from src.models.job import JobStatus
-from src.models.sse_event import SSEEvent
 from src.tools.arxiv import fetch_arxiv_paper
-from src.tools.packaging import create_zip_package
+from src.tools.packaging import create_zip_package, upload_to_s3
 
 if TYPE_CHECKING:
     from src.services.job_manager import JobManager
-    from src.services.sse import EventBus
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Pipeline stages used for SSE progress reporting
+# Pipeline stages used for progress reporting
 # ---------------------------------------------------------------------------
 
 STAGES = [
@@ -78,7 +76,7 @@ def create_orchestrator_agent(model: str) -> SequentialAgent:
 
 
 # ---------------------------------------------------------------------------
-# Programmatic pipeline execution with SSE progress
+# Programmatic pipeline execution with DynamoDB progress
 # ---------------------------------------------------------------------------
 
 
@@ -127,32 +125,27 @@ async def _run_single_agent(
 
 
 async def _publish_progress(
-    event_bus: EventBus | None,
     job_manager: JobManager | None,
     job_id: str,
     stage_index: int,
 ) -> None:
-    """Publish an SSE progress event and update job status.
+    """Update job progress in DynamoDB.
 
     Args:
-        event_bus: Optional SSE event bus for real-time progress.
-        job_manager: Optional job manager for status updates.
+        job_manager: Optional job manager for progress updates.
         job_id: The job identifier.
         stage_index: Index into :data:`STAGES`.
     """
     stage = STAGES[stage_index]
 
     if job_manager is not None:
-        await job_manager.update_status(job_id, stage["status"])
-
-    if event_bus is not None:
-        event = SSEEvent(
-            event=stage["name"],
-            step=stage["name"],
-            message=stage["label"],
+        await job_manager.update_progress(
+            job_id=job_id,
+            status=stage["status"],
+            current_step=stage["name"],
             progress=stage["progress"],
+            message=stage["label"],
         )
-        await event_bus.publish(job_id, event)
 
     logger.info("Pipeline [%s] stage=%s progress=%d%%", job_id, stage["name"], stage["progress"])
 
@@ -160,27 +153,25 @@ async def _publish_progress(
 async def run_pipeline(
     arxiv_url: str,
     job_id: str,
-    event_bus: EventBus | None = None,
     job_manager: JobManager | None = None,
 ) -> dict[str, Any]:
-    """Execute the full translation pipeline with SSE progress reporting.
+    """Execute the full translation pipeline with DynamoDB progress reporting.
 
-    Runs each agent in sequence, publishing progress events between stages.
-    The TeX fetch stage calls the arXiv tool directly (no LLM needed),
-    while subsequent stages use LLM-based agents.
+    Runs each agent in sequence, updating progress in DynamoDB between stages.
+    The frontend polls the ``GET /api/v1/jobs/{job_id}/status`` endpoint to
+    read the latest progress.
 
     Args:
         arxiv_url: The arXiv paper URL to process.
         job_id: Unique job identifier for progress tracking.
-        event_bus: Optional SSE event bus for real-time progress.
-        job_manager: Optional job manager for status updates.
+        job_manager: Optional job manager for progress updates.
 
     Returns:
         A dict containing:
           - ``markdown_en``: English Markdown content.
           - ``markdown_ja``: Japanese Markdown content.
           - ``summary_ja``: Japanese summary.
-          - ``zip_path``: Path to the output ZIP archive (or ``None``).
+          - ``download_url``: Presigned S3 URL for the output ZIP (or ``None``).
     """
     settings = get_settings()
     model = settings.LLM_MODEL
@@ -189,19 +180,19 @@ async def run_pipeline(
         "markdown_en": None,
         "markdown_ja": None,
         "summary_ja": None,
-        "zip_path": None,
+        "download_url": None,
     }
 
     try:
         # ---- Stage 0: Fetch TeX ----
-        await _publish_progress(event_bus, job_manager, job_id, 0)
+        await _publish_progress(job_manager, job_id, 0)
 
         # Fetch directly — no LLM needed for downloading/extracting files.
         tex_content, image_paths, work_dir = fetch_arxiv_paper(arxiv_url)
         image_paths_str = "\n".join(str(p) for p in image_paths)
 
         # ---- Stage 1: TeX -> Markdown ----
-        await _publish_progress(event_bus, job_manager, job_id, 1)
+        await _publish_progress(job_manager, job_id, 1)
         tex2md_agent = create_tex2markdown_agent(model)
         markdown_en = await _run_single_agent(
             tex2md_agent,
@@ -214,7 +205,7 @@ async def run_pipeline(
         results["markdown_en"] = markdown_en
 
         # ---- Stage 2: Translation ----
-        await _publish_progress(event_bus, job_manager, job_id, 2)
+        await _publish_progress(job_manager, job_id, 2)
         translation_agent = create_translation_agent(model)
         markdown_ja = await _run_single_agent(
             translation_agent,
@@ -223,7 +214,7 @@ async def run_pipeline(
         results["markdown_ja"] = markdown_ja
 
         # ---- Stage 3: Summary ----
-        await _publish_progress(event_bus, job_manager, job_id, 3)
+        await _publish_progress(job_manager, job_id, 3)
         summary_agent = create_summary_agent(model)
         summary_ja = await _run_single_agent(
             summary_agent,
@@ -232,7 +223,7 @@ async def run_pipeline(
         results["summary_ja"] = summary_ja
 
         # ---- Stage 4: Packaging ----
-        await _publish_progress(event_bus, job_manager, job_id, 4)
+        await _publish_progress(job_manager, job_id, 4)
         zip_path = create_zip_package(
             paper_en_md=markdown_en,
             paper_ja_md=markdown_ja,
@@ -240,22 +231,19 @@ async def run_pipeline(
             image_paths=image_paths,
             work_dir=work_dir,
         )
-        results["zip_path"] = str(zip_path)
+
+        # Upload to S3 and get presigned URL
+        download_url = upload_to_s3(
+            zip_path=zip_path,
+            job_id=job_id,
+            bucket_name=settings.S3_BUCKET_NAME,
+            presigned_url_expiry=settings.S3_PRESIGNED_URL_EXPIRY,
+        )
+        results["download_url"] = download_url
 
         # ---- Done ----
         if job_manager is not None:
-            await job_manager.set_result(job_id, zip_path)
-
-        if event_bus is not None:
-            complete_event = SSEEvent(
-                event="complete",
-                step="done",
-                message="処理が完了しました",
-                progress=100,
-                data={"download_url": f"/api/v1/jobs/{job_id}/download"},
-            )
-            await event_bus.publish(job_id, complete_event)
-            await event_bus.remove(job_id)
+            await job_manager.set_result(job_id, download_url)
 
         logger.info("Pipeline [%s] completed successfully", job_id)
 
@@ -264,17 +252,6 @@ async def run_pipeline(
 
         if job_manager is not None:
             await job_manager.set_error(job_id, "Pipeline execution failed")
-
-        if event_bus is not None:
-            error_event = SSEEvent(
-                event="error",
-                step="error",
-                message="処理中にエラーが発生しました",
-                progress=0,
-                data={"message": "Pipeline execution failed"},
-            )
-            await event_bus.publish(job_id, error_event)
-            await event_bus.remove(job_id)
 
         raise
 

@@ -44,16 +44,21 @@ LLM_MODEL=gemini-2.5-pro-preview-05-06
 APP_ENV=development
 LOG_LEVEL=DEBUG
 CORS_ORIGINS=http://localhost:5173
+
+# DynamoDB Local (Docker Compose で自動設定されるため通常は不要)
+# DYNAMODB_TABLE_NAME=arxiv-translator-jobs
+# DYNAMODB_ENDPOINT_URL=http://localhost:8100
 ```
 
 > **Note**: ローカル開発では `COGNITO_*` や `S3_*` の設定は不要です。
 > `APP_ENV=development` の場合、Cognito 認証はスキップされます。
+> DynamoDB Local は Docker Compose で自動的に起動・テーブル作成されます。
 
 ---
 
 ## 方法 1: Docker Compose で起動 (推奨)
 
-最も簡単な方法です。コマンド1つで backend + frontend が起動します。
+最も簡単な方法です。コマンド1つで DynamoDB Local + backend + frontend が起動します。
 
 ### 起動
 
@@ -69,6 +74,7 @@ docker compose up --build
 | Backend (API) | http://localhost:8000 |
 | API ドキュメント (Swagger) | http://localhost:8000/docs |
 | ヘルスチェック | http://localhost:8000/api/v1/health |
+| DynamoDB Local | http://localhost:8100 |
 
 ### ホットリロード
 
