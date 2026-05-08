@@ -203,18 +203,24 @@ async def run_pipeline(
             work_dir=work_dir,
         )
 
-        # Upload to S3 and get presigned URL
-        download_url = upload_to_s3(
-            zip_path=zip_path,
-            job_id=job_id,
-            bucket_name=settings.S3_BUCKET_NAME,
-            presigned_url_expiry=settings.S3_PRESIGNED_URL_EXPIRY,
-        )
+        # Upload to S3 (production) or keep locally (local dev)
+        if settings.S3_BUCKET_NAME:
+            download_url = upload_to_s3(
+                zip_path=zip_path,
+                job_id=job_id,
+                bucket_name=settings.S3_BUCKET_NAME,
+                presigned_url_expiry=settings.S3_PRESIGNED_URL_EXPIRY,
+            )
+        else:
+            # Local development: serve via the download endpoint
+            download_url = f"/api/v1/jobs/{job_id}/download"
+            logger.info("S3_BUCKET_NAME not set — ZIP kept locally at %s", zip_path)
         results["download_url"] = download_url
 
         # ---- Done ----
         if job_manager is not None:
-            await job_manager.set_result(job_id, download_url)
+            local_path = str(zip_path) if not settings.S3_BUCKET_NAME else None
+            await job_manager.set_result(job_id, download_url, local_result_path=local_path)
 
         logger.info("Pipeline [%s] completed successfully", job_id)
 

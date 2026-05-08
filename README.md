@@ -109,7 +109,8 @@ output.zip
 | メソッド | エンドポイント | 説明 |
 |---|---|---|
 | POST | `/api/v1/convert` | 変換ジョブを作成（202 即時返却） |
-| GET | `/api/v1/jobs/{job_id}/status` | ジョブ進捗をポーリング |
+| GET | `/api/v1/jobs/{job_id}/status` | ジョブ進捗をポーリング。完了時に `download_url` を返す |
+| GET | `/api/v1/jobs/{job_id}/download` | ZIP ダウンロード（ローカル開発のみ。本番は `download_url` の S3 presigned URL を直接使用） |
 | GET | `/api/v1/health` | ヘルスチェック |
 
 ## ドキュメント

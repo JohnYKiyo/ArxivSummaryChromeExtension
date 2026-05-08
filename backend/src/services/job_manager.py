@@ -94,6 +94,7 @@ class JobManager:
             progress=int(item.get("progress", 0)),
             message=item.get("message"),
             download_url=item.get("download_url"),
+            local_result_path=item.get("local_result_path"),
             error=item.get("error"),
         )
 
@@ -152,28 +153,41 @@ class JobManager:
         )
         logger.info("Job %s stage=%s progress=%d%%", job_id, current_step, progress)
 
-    async def set_result(self, job_id: str, download_url: str) -> None:
+    async def set_result(
+        self,
+        job_id: str,
+        download_url: str,
+        local_result_path: str | None = None,
+    ) -> None:
         """Mark a job as completed and store its download URL.
 
         Args:
             job_id: The unique job identifier.
-            download_url: Presigned S3 URL for the output ZIP.
+            download_url: Presigned S3 URL or local API path for the output ZIP.
+            local_result_path: Absolute local file path (local dev only).
         """
+        update_expr = (
+            "SET #s = :status, progress = :prog, current_step = :step, "
+            "message = :msg, download_url = :url, updated_at = :now"
+        )
+        values: dict[str, Any] = {
+            ":status": JobStatus.COMPLETED.value,
+            ":prog": 100,
+            ":step": "done",
+            ":msg": "処理が完了しました",
+            ":url": download_url,
+            ":now": datetime.now(UTC).isoformat(),
+        }
+
+        if local_result_path is not None:
+            update_expr += ", local_result_path = :local_path"
+            values[":local_path"] = local_result_path
+
         self._table.update_item(
             Key={"job_id": job_id},
-            UpdateExpression=(
-                "SET #s = :status, progress = :prog, current_step = :step, "
-                "message = :msg, download_url = :url, updated_at = :now"
-            ),
+            UpdateExpression=update_expr,
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
-                ":status": JobStatus.COMPLETED.value,
-                ":prog": 100,
-                ":step": "done",
-                ":msg": "処理が完了しました",
-                ":url": download_url,
-                ":now": datetime.now(UTC).isoformat(),
-            },
+            ExpressionAttributeValues=values,
         )
         logger.info("Job %s completed: %s", job_id, download_url)
 

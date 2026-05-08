@@ -30,4 +30,5 @@ class Job:
     progress: int = 0
     message: str | None = None
     download_url: str | None = None
+    local_result_path: str | None = None  # ローカル開発時のみ使用
     error: str | None = None

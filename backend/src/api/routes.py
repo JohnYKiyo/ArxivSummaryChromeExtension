@@ -8,10 +8,12 @@ Defines the following endpoints:
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import boto3
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 
 from src.api.auth import get_current_user
 from src.config import get_settings
@@ -154,6 +156,56 @@ async def get_job_status(
         message=job.message,
         error=job.error,
         download_url=job.download_url,
+    )
+
+
+@router.get(
+    "/jobs/{job_id}/download",
+    responses={404: {"model": ErrorResponse}},
+)
+async def download_job_result(
+    job_id: str,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> FileResponse:
+    """Download the ZIP result of a completed job (local development only).
+
+    In production, the frontend downloads directly from the S3 presigned URL
+    stored in ``download_url``. This endpoint exists only for local development
+    where ``S3_BUCKET_NAME`` is not set and the ZIP is kept on disk.
+    """
+    job_manager = _get_job_manager()
+    settings = get_settings()
+
+    if settings.S3_BUCKET_NAME:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Direct download not available in production; use the presigned URL from /status",
+        )
+
+    job = await job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job not found: {job_id}",
+        )
+
+    if job.local_result_path is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} has no local result (not yet completed or result was deleted)",
+        )
+
+    result_path = Path(job.local_result_path)
+    if not result_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Result file no longer available",
+        )
+
+    return FileResponse(
+        path=result_path,
+        media_type="application/zip",
+        filename="output.zip",
     )
 
 

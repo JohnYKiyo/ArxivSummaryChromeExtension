@@ -50,9 +50,10 @@ CORS_ORIGINS=http://localhost:5173
 # DYNAMODB_ENDPOINT_URL=http://localhost:8100
 ```
 
-> **Note**: ローカル開発では `COGNITO_*` や `S3_*` の設定は不要です。
-> `APP_ENV=development` の場合、Cognito 認証はスキップされます。
-> DynamoDB Local は Docker Compose で自動的に起動・テーブル作成されます。
+> **Note**: ローカル開発では `COGNITO_*` と `S3_*` の設定は不要です。
+> - `APP_ENV=development` の場合、Cognito 認証はスキップされます
+> - `S3_BUCKET_NAME` が空の場合、ZIP ファイルはローカルに保存され `GET /api/v1/jobs/{job_id}/download` で取得できます（S3 アカウント不要）
+> - DynamoDB Local は Docker Compose で自動的に起動・テーブル作成されます
 
 ---
 
