@@ -1,10 +1,13 @@
-"""OrchestratorAgent - Sequential pipeline controller.
+"""Pipeline orchestrator for the arXiv translation workflow.
 
 Coordinates the execution of all agents in the translation pipeline:
-TexFetchAgent -> Tex2MarkdownAgent -> TranslationAgent -> SummaryAgent.
+fetch_arxiv_paper -> Tex2MarkdownAgent -> TranslationAgent -> SummaryAgent.
 Reports progress via DynamoDB updates at each stage transition.
-Implemented as a Google ADK SequentialAgent with sub-agents, plus a
-``run_pipeline`` helper for programmatic invocation with progress tracking.
+
+Each agent is run independently with its own InMemoryRunner so that
+DynamoDB progress writes can be interleaved between stages and
+non-LLM steps (arXiv fetch, ZIP packaging, S3 upload) can be mixed
+into the same flow.
 """
 
 from __future__ import annotations
@@ -14,13 +17,11 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 from google.adk.agents import LlmAgent
-from google.adk.agents.sequential_agent import SequentialAgent
 from google.adk.runners import InMemoryRunner
 from google.genai import types as genai_types
 
 from src.agents.summary import create_summary_agent
 from src.agents.tex2markdown import create_tex2markdown_agent
-from src.agents.tex_fetch import create_tex_fetch_agent
 from src.agents.translation import create_translation_agent
 from src.config import get_settings
 from src.models.job import JobStatus
@@ -45,38 +46,8 @@ STAGES = [
 ]
 
 
-def create_orchestrator_agent(model: str) -> SequentialAgent:
-    """Create the top-level orchestrator as a :class:`SequentialAgent`.
-
-    The orchestrator runs four sub-agents in sequence.  Each sub-agent
-    stores its output in the shared session state via ``output_key``,
-    so downstream agents can reference upstream results using
-    ``{output_key}`` placeholders in their instructions.
-
-    Args:
-        model: The LLM model identifier.
-
-    Returns:
-        A configured :class:`SequentialAgent`.
-    """
-    tex_fetch = create_tex_fetch_agent(model)
-    tex2md = create_tex2markdown_agent(model)
-    translation = create_translation_agent(model)
-    summary = create_summary_agent(model)
-
-    return SequentialAgent(
-        name="OrchestratorAgent",
-        description=(
-            "Orchestrates the full arXiv paper translation pipeline: "
-            "fetch TeX, convert to Markdown, translate to Japanese, "
-            "and generate a summary."
-        ),
-        sub_agents=[tex_fetch, tex2md, translation, summary],
-    )
-
-
 # ---------------------------------------------------------------------------
-# Programmatic pipeline execution with DynamoDB progress
+# Pipeline execution with DynamoDB progress
 # ---------------------------------------------------------------------------
 
 
