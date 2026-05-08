@@ -61,6 +61,41 @@ docker compose up
 - [ローカル開発セットアップ](docs/SETUP_LOCAL.md)
 - [AWS デプロイ](docs/DEPLOY_AWS.md)
 
+## 使い方
+
+arXiv Translator には **2つの利用パターン** があります。
+
+### パターン 1: Web UI（ブラウザで直接アクセス）
+
+バックエンドを起動後、ブラウザで Web UI にアクセスして使います。
+
+1. `http://localhost:5173`（ローカル）または CloudFront URL（本番）を開く
+2. arXiv の論文 URL を入力欄に貼り付ける（例: `https://arxiv.org/abs/2301.00001`）
+3. **「変換開始」** をクリック
+4. 進捗バーで各ステージ（TeX取得 → Markdown変換 → 翻訳 → 要約）を確認
+5. 完了後、**「ダウンロード」** ボタンから ZIP ファイルを取得
+
+### パターン 2: Chrome 拡張機能（arxiv.org で直接操作）
+
+arxiv.org を閲覧しながら、ページを離れずに変換を開始できます。拡張機能のインストールが必要です（後述）。
+
+1. [arxiv.org](https://arxiv.org) の論文ページを開く
+2. ページ上に自動表示される **「翻訳・要約」** ボタンをクリック
+3. 拡張機能のポップアップが開き、URL が自動入力された状態で **「変換開始」** をクリック
+4. 進捗を確認し、完了後に ZIP をダウンロード
+
+### ZIP の中身
+
+```
+output.zip
+├── paper_en.md     # 英語 Markdown
+├── paper_ja.md     # 日本語翻訳
+├── summary_ja.md   # 日本語要約
+└── images/         # 論文中の図表
+```
+
+---
+
 ## Chrome 拡張機能のインストール
 
 ### ビルド
@@ -85,24 +120,6 @@ npm run build
    - ローカル: `http://localhost:8000`
    - 本番: `https://<API Gateway URL>`
 3. Cognito アカウントでログイン
-
-### 使い方
-
-1. [arxiv.org](https://arxiv.org) の論文ページ（例: `https://arxiv.org/abs/2301.00001`）を開く
-2. ページ上に表示される **「翻訳・要約」** ボタンをクリック、またはツールバーアイコンから拡張機能を開く
-3. URL が自動入力された状態で **「変換開始」** をクリック
-4. 進捗バーで各ステージ（TeX取得 → Markdown変換 → 翻訳 → 要約）を確認
-5. 完了後、**「ダウンロード」** ボタンから ZIP ファイルを取得
-
-### ZIP の中身
-
-```
-output.zip
-├── paper_en.md     # 英語 Markdown
-├── paper_ja.md     # 日本語翻訳
-├── summary_ja.md   # 日本語要約
-└── images/         # 論文中の図表
-```
 
 ## API
 
