@@ -23,11 +23,15 @@ def settings_override(monkeypatch: pytest.MonkeyPatch):
     """Override settings for tests so a real .env file is not required."""
     env_vars = {
         "GOOGLE_API_KEY": "test-api-key-not-real",
-        "LLM_MODEL": "gemini-2.5-pro-preview-05-06",
+        "LLM_MODEL": "gemini-2.5-pro",
         "AWS_REGION": "us-east-1",
+        # Defaults represent local-dev mode (no S3 / no pipeline Lambda),
+        # matching the empty-by-default values in .env.example. Tests that
+        # need production behaviour should monkeypatch these explicitly.
+        "S3_BUCKET_NAME": "",
+        "PIPELINE_LAMBDA_NAME": "",
         "COGNITO_USER_POOL_ID": "us-east-1_TestPool",
         "COGNITO_APP_CLIENT_ID": "test-client-id",
-        "S3_BUCKET_NAME": "test-bucket",
         "DYNAMODB_TABLE_NAME": "test-arxiv-translator-jobs",
         "APP_ENV": "test",
         "LOG_LEVEL": "DEBUG",

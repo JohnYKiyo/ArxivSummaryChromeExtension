@@ -30,6 +30,9 @@ COPY --from=builder /install /usr/local
 
 COPY backend/src/ ./src/
 COPY docs/ ./docs/
+# pyproject.toml is needed at runtime so pytest reads tool.pytest.ini_options
+# (asyncio_mode = "auto"). It's also a few KB, so the overhead is trivial.
+COPY backend/pyproject.toml ./
 
 RUN groupadd --gid 1000 appuser && \
     useradd --uid 1000 --gid appuser --shell /bin/bash --create-home appuser && \
