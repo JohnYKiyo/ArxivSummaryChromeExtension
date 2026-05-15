@@ -104,7 +104,9 @@ class BackendStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12,
             handler="src.pipeline_handler.handler",
             code=lambda_.Code.from_asset(
-                "../backend",
+                # Path is relative to where ``cdk synth`` runs (``infrastructure/cdk/``);
+                # the backend source lives at the repository root, two levels up.
+                "../../backend",
                 exclude=["tests", "*.pyc", "__pycache__", ".venv", ".mypy_cache", ".ruff_cache"],
             ),
             memory_size=1024,
@@ -127,7 +129,9 @@ class BackendStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12,
             handler="src.main.handler",
             code=lambda_.Code.from_asset(
-                "../backend",
+                # Path is relative to where ``cdk synth`` runs (``infrastructure/cdk/``);
+                # the backend source lives at the repository root, two levels up.
+                "../../backend",
                 exclude=["tests", "*.pyc", "__pycache__", ".venv", ".mypy_cache", ".ruff_cache"],
             ),
             memory_size=256,
