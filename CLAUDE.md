@@ -101,7 +101,12 @@ Source → Markdown is **deterministic** (library, no LLM): `markdownify` for HT
 
 ### Agent output extraction
 
-`_extract_final_text_async` returns the **longest text** seen across all ADK events, not the last one. Gemini emits multiple events per turn (thinking, streaming deltas, brief wrap-ups); naively keeping only the last leaves you with a short wrap message and loses the actual answer.
+`_extract_final_text_async` **concatenates every non-thought text part** across all ADK events. Earlier strategies (last-event-only, longest-text-only) silently dropped most of the answer because Gemini streams long outputs as many small `Part` objects rather than one big text. The current rule:
+
+- Skip parts where `part.thought` is `True` (Gemini's internal reasoning).
+- Concatenate every other `part.text` in arrival order.
+
+Translation outputs in particular arrive as 15–25 parts for a typical paper; picking any single one loses the rest.
 
 ### Two-Lambda deployment (`infrastructure/cdk/stacks/backend_stack.py`)
 
@@ -168,4 +173,5 @@ When a change tempts you to break one of these (e.g., "I'll just import `boto3` 
 - **Progress is int 0–100**, never float 0–1. The `* 100` conversion in old code was a bug from the SSE era.
 - **Don't add a `SequentialAgent`** to replace `run_pipeline()` — it was tried and removed because progress writes can't interleave inside an ADK sequential run, *and* because half the stages are deterministic library calls (not LLMs) that don't belong in an agent flow at all.
 - **ADK prompt placeholders**: agent `instruction` strings have `{var_name}` substituted from session state when `var_name` is a valid Python identifier. If you write `{filename}` or `{figure}` as a literal example in a prompt, ADK will raise `KeyError`. Either (a) use a non-identifier inside the braces — `{...}` is the easiest — or (b) describe the syntax in prose. The existing prompts in `agents/translation.py` and `agents/summary.py` follow this rule.
-- **Agent output extraction**: use the longest text across all events (`_extract_final_text_async`), not the last one. Gemini emits thinking/streaming/wrap-up events; the last is often a short ack while the actual answer is somewhere in the middle.
+- **Agent output extraction**: concatenate every non-thought text part across all events (`_extract_final_text_async`). For long outputs (translation of a full paper) Gemini emits 15–25 short parts; picking only one — last, first, or longest — drops most of the answer.
+- **Long outputs need `max_output_tokens`**: Gemini 2.5 Pro defaults to ~8K output tokens which silently truncates a typical paper translation. Set `max_output_tokens=65536` in the agent's `generate_content_config` whenever the output can be book-length.

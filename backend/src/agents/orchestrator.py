@@ -58,29 +58,44 @@ STAGES = [
 
 
 async def _extract_final_text_async(event_stream: Any) -> str:
-    """Walk an ADK event stream and return the agent's full text output.
+    """Walk an ADK event stream and concatenate all non-thought text parts.
 
-    ADK emits several events during one agent turn — short "thinking" notes,
-    streaming deltas, and the final full answer. Earlier code captured only
-    the *last* event, which for some models is a brief wrap-up rather than
-    the answer itself, leaving us with a truncated result. Keeping the
-    *longest* text seen is a robust heuristic: thinking notes are typically
-    one or two short sentences, while the final answer is orders of
-    magnitude larger.
+    ADK emits several events per agent turn. Each event has zero or more
+    ``parts``; each part is either a "thought" (Gemini's internal
+    reasoning, marked with ``part.thought = True``) or a real text chunk
+    that belongs in the answer.
+
+    Long outputs are streamed across multiple non-thought parts. The
+    earlier "pick the longest part" heuristic dropped all but one chunk,
+    silently truncating long translations — typical paper outputs are
+    ~30KB Japanese which Gemini emits as several streaming chunks rather
+    than one monolithic text.
+
+    Strategy:
+      - Skip parts marked as thoughts.
+      - Concatenate everything else in arrival order.
     """
-    longest_text = ""
-    event_count = 0
+    chunks: list[str] = []
+    thought_parts = 0
+    text_parts = 0
     async for event in event_stream:
-        event_count += 1
         if event.content and event.content.parts:
             for part in event.content.parts:
+                if getattr(part, "thought", False):
+                    thought_parts += 1
+                    continue
                 text = getattr(part, "text", None)
                 if text:
-                    logger.debug("Agent event #%d: text length=%d", event_count, len(text))
-                    if len(text) > len(longest_text):
-                        longest_text = text
-    logger.info("Agent emitted %d events; final output: %d chars", event_count, len(longest_text))
-    return longest_text
+                    text_parts += 1
+                    chunks.append(text)
+    result = "".join(chunks)
+    logger.info(
+        "Agent emitted %d text parts (%d thought parts skipped); total output: %d chars",
+        text_parts,
+        thought_parts,
+        len(result),
+    )
+    return result
 
 
 async def _run_single_agent(
