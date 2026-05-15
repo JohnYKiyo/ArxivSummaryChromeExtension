@@ -221,12 +221,23 @@ npm run build
 
 ## Chrome 拡張機能の開発
 
-### ビルドなしでテスト (開発モード)
+### ビルド
+
+```bash
+cd frontend/chrome-extension
+npm install
+npm run build       # 一回ビルド → dist/ に出力
+npm run watch       # ウォッチモード（変更時に自動ビルド）
+```
+
+### Chrome への読み込み
 
 1. Chrome で `chrome://extensions/` を開く
 2. 右上の「デベロッパーモード」を有効にする
 3. 「パッケージ化されていない拡張機能を読み込む」をクリック
-4. `frontend/chrome-extension/` フォルダを選択
+4. `frontend/chrome-extension/dist/` フォルダを選択
+
+> **Note**: `dist/` を読み込むので、ソースを変更した後は `npm run build`（またはウォッチ中なら自動ビルド）が必要です。
 
 ### 設定
 
