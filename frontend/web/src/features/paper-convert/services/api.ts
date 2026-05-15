@@ -9,7 +9,7 @@ export async function submitUrl(arxivUrl: string): Promise<SubmitResponse> {
   const response = await fetch(`${BASE_URL}/api/v1/convert`, {
     method: "POST",
     headers: getHeaders(),
-    body: JSON.stringify({ url: arxivUrl }),
+    body: JSON.stringify({ arxiv_url: arxivUrl }),
   });
 
   if (!response.ok) {
