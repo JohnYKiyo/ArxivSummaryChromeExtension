@@ -12,12 +12,12 @@ from pathlib import Path
 
 import pytest
 
+from src.tools.arxiv import _extract_metadata_and_rewrite
 from src.tools.tex_to_markdown import (
     PandocConversionError,
     PandocNotInstalledError,
     tex_to_markdown,
 )
-
 
 _PANDOC_AVAILABLE = shutil.which("pandoc") is not None
 
@@ -125,3 +125,35 @@ def test_raises_when_pandoc_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     monkeypatch.setattr("src.tools.tex_to_markdown.shutil.which", lambda _name: None)
     with pytest.raises(PandocNotInstalledError):
         tex_to_markdown(r"\documentclass{article}\begin{document}x\end{document}", work_dir=tmp_path)
+
+
+def test_title_block_renders_after_metadata_rewrite(tmp_path: Path) -> None:
+    """End-to-end: TeX with \\title/\\author/abstract → Markdown with H1/authors/H2 Abstract.
+
+    Verifies the full title-recovery pipeline that fixes the bug where pandoc
+    (without ``--standalone``) was silently dropping these elements.
+    """
+    tex = (
+        r"\documentclass{article}"
+        r"\title{Sample Paper Title}"
+        r"\author{Alice \and Bob}"
+        r"\begin{document}"
+        r"\maketitle"
+        r"\begin{abstract}"
+        r"This is the abstract body."
+        r"\end{abstract}"
+        r"\section{Introduction}"
+        r"This is the intro."
+        r"\end{document}"
+    )
+    rewritten = _extract_metadata_and_rewrite(tex)
+    md = tex_to_markdown(rewritten, work_dir=tmp_path)
+    title_idx = md.index("Sample Paper Title")
+    authors_idx = md.index("Alice, Bob")
+    abstract_heading_idx = md.index("Abstract")
+    abstract_body_idx = md.index("This is the abstract body")
+    intro_idx = md.index("This is the intro")
+    assert title_idx < authors_idx < abstract_heading_idx < abstract_body_idx < intro_idx
+    # The title and abstract heading are rendered as actual Markdown headings.
+    assert re.search(r"^#\s+Sample Paper Title", md, re.MULTILINE), md
+    assert re.search(r"^##?\s+Abstract", md, re.MULTILINE), md
