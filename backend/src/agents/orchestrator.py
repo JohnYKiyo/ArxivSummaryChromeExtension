@@ -1,20 +1,18 @@
 """Pipeline orchestrator for the arXiv translation workflow.
 
-Coordinates the execution of all agents in the translation pipeline:
+Coordinates the execution of all stages:
 
-    fetch_arxiv_paper -> (Tex2MarkdownAgent OR html_to_markdown) ->
+    fetch_arxiv_paper -> source-to-markdown (deterministic) ->
         TranslationAgent -> SummaryAgent
 
-The first conversion step branches on the format returned by
-``fetch_arxiv_paper``: HTML papers (preferred when available) are converted
-deterministically with the ``markdownify`` library; TeX-only papers use
-the ``Tex2MarkdownAgent`` LLM. The downstream stages (translation,
-summary, packaging) are identical for both.
-
-Each agent is run independently with its own InMemoryRunner so that
-DynamoDB progress writes can be interleaved between stages and
-non-LLM steps (arXiv fetch, ZIP packaging, S3 upload) can be mixed
-into the same flow.
+The source-to-markdown step branches on the format returned by
+``fetch_arxiv_paper``: HTML papers are converted via ``markdownify``,
+TeX papers via ``pandoc``. Both paths are pure-library transforms with
+no LLM call, so only the translation and summary stages remain on the
+LLM. Each LLM agent is run independently with its own InMemoryRunner so
+that DynamoDB progress writes can be interleaved between stages and
+non-LLM steps (arXiv fetch, ZIP packaging, S3 upload) can be mixed into
+the same flow.
 """
 
 from __future__ import annotations
@@ -28,13 +26,13 @@ from google.adk.runners import InMemoryRunner
 from google.genai import types as genai_types
 
 from src.agents.summary import create_summary_agent
-from src.agents.tex2markdown import create_tex2markdown_agent
 from src.agents.translation import create_translation_agent
 from src.config import get_settings
 from src.models.job import JobStatus
 from src.tools.arxiv import PdfOnlyPaperError, fetch_arxiv_paper
 from src.tools.html_to_markdown import html_to_markdown
 from src.tools.packaging import create_zip_package, upload_to_s3
+from src.tools.tex_to_markdown import tex_to_markdown
 
 if TYPE_CHECKING:
     from src.services.job_manager import JobManager
@@ -193,27 +191,18 @@ async def run_pipeline(
         paper = fetch_arxiv_paper(arxiv_url)
         work_dir = paper.work_dir
 
-        # ---- Stage 1: Source -> Markdown ----
+        # ---- Stage 1: Source -> Markdown (deterministic, no LLM) ----
         await _publish_progress(job_manager, job_id, 1)
         if paper.kind == "html":
-            # arxiv.org/html is well-structured — convert deterministically
-            # via the markdownify library, no LLM needed.
             base_url = f"https://arxiv.org/html/{paper.arxiv_id}/"
             markdown_en = html_to_markdown(paper.content, base_url=base_url)
-            logger.info("HTML → Markdown converted (%d chars) without LLM", len(markdown_en))
+            logger.info("HTML → Markdown via markdownify (%d chars)", len(markdown_en))
         else:
-            # TeX source — needs the LLM agent to convert structure, math,
-            # citations, etc. into clean Markdown.
-            image_paths_str = "\n".join(str(p) for p in paper.images)
-            tex2md_agent = create_tex2markdown_agent(model)
-            markdown_en = await _run_single_agent(
-                tex2md_agent,
-                (
-                    f"Convert the following TeX content to Markdown.\n\n"
-                    f"Image paths available:\n{image_paths_str}\n\n"
-                    f"TeX content:\n{paper.content}"
-                ),
-            )
+            # TeX source — pandoc handles structure, math, citations, figures.
+            # \input / \include were already expanded upstream, so the input
+            # is a single self-contained document.
+            markdown_en = tex_to_markdown(paper.content, work_dir=paper.work_dir)
+            logger.info("TeX → Markdown via pandoc (%d chars)", len(markdown_en))
         results["markdown_en"] = markdown_en
 
         # ---- Stage 2: Translation ----
