@@ -13,6 +13,7 @@ from aws_cdk import (
     CfnOutput,
     Duration,
     RemovalPolicy,
+    Size,
     Stack,
     Tags,
     aws_apigatewayv2 as apigwv2,
@@ -108,7 +109,7 @@ class BackendStack(Stack):
             ),
             memory_size=1024,
             timeout=Duration.minutes(15),
-            ephemeral_storage_size=lambda_.Size.mebibytes(2048),
+            ephemeral_storage_size=Size.mebibytes(2048),
             environment={
                 **common_env,
                 "PIPELINE_LAMBDA_NAME": "",  # Not needed in pipeline Lambda itself
