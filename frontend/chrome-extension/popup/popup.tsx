@@ -3,13 +3,15 @@
  *
  * Displays the extension UI when the toolbar icon is clicked.
  * Auto-fills the current tab's arXiv URL, shows conversion progress
- * via SSE, and provides a download link for completed jobs.
+ * via polling (GET /api/v1/jobs/{jobId}/status every 3 s), and provides
+ * a download link for completed jobs.
  */
 
 // ── Constants ───────────────────────────────────────────
 
 const DEFAULT_API_URL = "http://localhost:8000";
 const ARXIV_URL_PATTERN = /^https?:\/\/(www\.)?arxiv\.org\/(abs|pdf)\/[\d.]+/;
+const POLL_INTERVAL_MS = 3000;
 
 // ── Types ───────────────────────────────────────────────
 
@@ -17,10 +19,14 @@ interface ConvertResponse {
   job_id: string;
 }
 
-interface SSEProgressEvent {
-  step: string;
-  progress: number;
-  message: string;
+interface StatusResponse {
+  job_id: string;
+  status: string;
+  current_step: string | null;
+  progress: number; // integer 0–100
+  message: string | null;
+  error: string | null;
+  download_url: string | null;
 }
 
 // ── DOM Elements ────────────────────────────────────────
@@ -49,7 +55,7 @@ const saveSettingsBtn = $<HTMLButtonElement>("save-settings");
 // ── State ───────────────────────────────────────────────
 
 let currentJobId: string | null = null;
-let eventSource: EventSource | null = null;
+let pollingInterval: ReturnType<typeof setInterval> | null = null;
 let apiBaseUrl: string = DEFAULT_API_URL;
 
 // ── Helpers ─────────────────────────────────────────────
@@ -85,6 +91,13 @@ function showError(msg: string): void {
   submitBtn.textContent = "翻訳を開始";
 }
 
+function stopPolling(): void {
+  if (pollingInterval !== null) {
+    clearInterval(pollingInterval);
+    pollingInterval = null;
+  }
+}
+
 // ── API ─────────────────────────────────────────────────
 
 async function getApiUrl(): Promise<string> {
@@ -111,53 +124,63 @@ async function submitConversion(arxivUrl: string): Promise<ConvertResponse> {
   return res.json();
 }
 
-function connectSSE(jobId: string): void {
-  if (eventSource) {
-    eventSource.close();
+/** Start polling GET /status for the given job every POLL_INTERVAL_MS ms. */
+function startPolling(jobId: string): void {
+  stopPolling();
+
+  // Immediate first poll, then repeat.
+  pollJobStatus(jobId);
+  pollingInterval = setInterval(() => {
+    pollJobStatus(jobId);
+  }, POLL_INTERVAL_MS);
+}
+
+async function pollJobStatus(jobId: string): Promise<void> {
+  // Guard: abort if another job was started while we were awaiting.
+  if (currentJobId !== jobId) {
+    stopPolling();
+    return;
   }
 
-  const url = `${apiBaseUrl}/api/v1/jobs/${jobId}/stream`;
-  eventSource = new EventSource(url);
-
-  eventSource.addEventListener("progress", (event: MessageEvent) => {
-    const data: SSEProgressEvent = JSON.parse(event.data);
-    updateProgress(data);
-  });
-
-  eventSource.addEventListener("complete", (_event: MessageEvent) => {
-    eventSource?.close();
-    eventSource = null;
-    onConversionComplete(jobId);
-  });
-
-  eventSource.addEventListener("error", (event: MessageEvent) => {
-    eventSource?.close();
-    eventSource = null;
-    let msg = "接続エラーが発生しました";
-    try {
-      const data = JSON.parse(event.data);
-      msg = data.message || msg;
-    } catch {
-      // use default message
+  try {
+    const res = await fetch(`${apiBaseUrl}/api/v1/jobs/${jobId}/status`);
+    if (!res.ok) {
+      throw new Error(`Status fetch failed: ${res.status}`);
     }
-    showError(msg);
-  });
 
-  eventSource.onerror = () => {
-    eventSource?.close();
-    eventSource = null;
-    showError("サーバーとの接続が切断されました");
-  };
+    const data: StatusResponse = await res.json();
+
+    if (currentJobId !== jobId) return;
+
+    if (data.status === "completed") {
+      stopPolling();
+      onConversionComplete(jobId, data.download_url);
+      return;
+    }
+
+    if (data.status === "error") {
+      stopPolling();
+      showError(data.error || "変換中にエラーが発生しました");
+      return;
+    }
+
+    // Still running — update progress UI.
+    updateProgress(data);
+  } catch (err) {
+    // Transient network error — keep polling; don't show error yet.
+    console.error("[popup] poll error:", err);
+  }
 }
 
 // ── UI Updates ──────────────────────────────────────────
 
-function updateProgress(data: SSEProgressEvent): void {
-  const pct = Math.round(data.progress * 100);
+function updateProgress(data: StatusResponse): void {
+  // progress is already an integer 0–100 (API change from float 0–1).
+  const pct = data.progress;
   progressBar.style.width = `${pct}%`;
   progressPercent.textContent = `${pct}%`;
-  progressLabel.textContent = data.step;
-  progressStep.textContent = data.message;
+  progressLabel.textContent = data.current_step || "";
+  progressStep.textContent = data.message || "";
 
   // Update badge via background script
   chrome.runtime.sendMessage({
@@ -166,7 +189,7 @@ function updateProgress(data: SSEProgressEvent): void {
   });
 }
 
-function onConversionComplete(jobId: string): void {
+function onConversionComplete(jobId: string, downloadUrl: string | null): void {
   progressBar.style.width = "100%";
   progressPercent.textContent = "100%";
   progressLabel.textContent = "完了";
@@ -182,8 +205,10 @@ function onConversionComplete(jobId: string): void {
   });
 
   downloadBtn.onclick = () => {
-    const downloadUrl = `${apiBaseUrl}/api/v1/jobs/${jobId}/download`;
-    chrome.tabs.create({ url: downloadUrl });
+    // Use the download_url returned by the API (presigned S3 URL in production,
+    // local /download endpoint in development).
+    const url = downloadUrl ?? `${apiBaseUrl}/api/v1/jobs/${jobId}/download`;
+    chrome.tabs.create({ url });
   };
 }
 
@@ -209,7 +234,7 @@ async function handleSubmit(): Promise<void> {
   try {
     const response = await submitConversion(arxivUrl);
     currentJobId = response.job_id;
-    connectSSE(currentJobId);
+    startPolling(currentJobId);
   } catch (err) {
     const message = err instanceof Error ? err.message : "不明なエラー";
     showError(message);
@@ -256,16 +281,18 @@ async function init(): Promise<void> {
     // Not in a context where we can query tabs; ignore
   }
 
-  // Check if there's an active job from the background
+  // Check if there's an active job from the background service worker.
   try {
     const response = await chrome.runtime.sendMessage({ type: "GET_STATUS" });
     if (response?.jobId && response?.status === "processing") {
-      currentJobId = response.jobId;
+      const resumedJobId: string = response.jobId;
+      currentJobId = resumedJobId;
       urlInput.value = response.arxivUrl || urlInput.value;
       submitBtn.disabled = true;
       submitBtn.textContent = "処理中...";
       show(progressSection);
-      connectSSE(currentJobId);
+      // Resume polling for the already-running job.
+      startPolling(resumedJobId);
     }
   } catch {
     // No active job

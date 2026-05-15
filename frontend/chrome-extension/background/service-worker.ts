@@ -4,11 +4,15 @@
  * Handles message passing between content scripts and the popup.
  * Manages API communication with the backend service and
  * coordinates the conversion workflow.
+ *
+ * Progress tracking uses polling (GET /api/v1/jobs/{jobId}/status every 3 s)
+ * instead of SSE, matching the backend's Lambda-compatible polling design.
  */
 
 // ── Constants ───────────────────────────────────────────
 
 const DEFAULT_API_URL = "http://localhost:8000";
+const POLL_INTERVAL_MS = 3000;
 
 // ── State ───────────────────────────────────────────────
 
@@ -17,9 +21,11 @@ interface JobState {
   arxivUrl: string;
   status: "processing" | "complete" | "error";
   progress: number;
+  downloadUrl: string | null;
 }
 
 let activeJob: JobState | null = null;
+let pollingInterval: ReturnType<typeof setInterval> | null = null;
 
 // ── Helpers ─────────────────────────────────────────────
 
@@ -35,6 +41,13 @@ function setBadgeText(text: string): void {
   chrome.action.setBadgeText({ text });
   if (text) {
     chrome.action.setBadgeBackgroundColor({ color: "#6366f1" });
+  }
+}
+
+function stopPolling(): void {
+  if (pollingInterval !== null) {
+    clearInterval(pollingInterval);
+    pollingInterval = null;
   }
 }
 
@@ -65,10 +78,10 @@ async function startConversion(
       arxivUrl,
       status: "processing",
       progress: 0,
+      downloadUrl: null,
     };
 
-    // Start listening to SSE in the background
-    listenToSSE(jobId);
+    startPolling(jobId);
 
     return { success: true, jobId };
   } catch (err) {
@@ -77,88 +90,101 @@ async function startConversion(
   }
 }
 
-async function listenToSSE(jobId: string): Promise<void> {
+/** Poll GET /api/v1/jobs/{jobId}/status every POLL_INTERVAL_MS milliseconds. */
+function startPolling(jobId: string): void {
+  stopPolling();
+
+  pollingInterval = setInterval(() => {
+    pollJobStatus(jobId).catch((err) => {
+      console.error("[service-worker] polling error:", err);
+    });
+  }, POLL_INTERVAL_MS);
+
+  // Kick off an immediate first poll instead of waiting one full interval.
+  pollJobStatus(jobId).catch((err) => {
+    console.error("[service-worker] polling error:", err);
+  });
+}
+
+async function pollJobStatus(jobId: string): Promise<void> {
+  // Guard: stop if the active job changed while we were awaiting.
+  if (activeJob?.jobId !== jobId) {
+    stopPolling();
+    return;
+  }
+
   const apiUrl = await getApiUrl();
-  const url = `${apiUrl}/api/v1/jobs/${jobId}/stream`;
 
   try {
-    const res = await fetch(url);
-    if (!res.ok || !res.body) {
-      throw new Error(`SSE connection failed: ${res.status}`);
+    const res = await fetch(`${apiUrl}/api/v1/jobs/${jobId}/status`);
+    if (!res.ok) {
+      throw new Error(`Status fetch failed: ${res.status}`);
     }
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
+    const data: {
+      job_id: string;
+      status: string;
+      current_step: string | null;
+      progress: number;
+      message: string | null;
+      error: string | null;
+      download_url: string | null;
+    } = await res.json();
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    if (activeJob?.jobId !== jobId) return;
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          const dataStr = line.slice(6).trim();
-          if (!dataStr) continue;
-
-          try {
-            const data = JSON.parse(dataStr);
-            handleSSEData(data, jobId);
-          } catch {
-            // skip malformed JSON
-          }
-        } else if (line.startsWith("event: ")) {
-          const eventType = line.slice(7).trim();
-          if (eventType === "complete") {
-            handleConversionComplete(jobId);
-            reader.cancel();
-            return;
-          }
-        }
-      }
+    if (data.status === "completed") {
+      stopPolling();
+      handleConversionComplete(jobId, data.download_url);
+      return;
     }
-  } catch (err) {
-    console.error("[service-worker] SSE error:", err);
-    if (activeJob?.jobId === jobId) {
+
+    if (data.status === "error") {
+      stopPolling();
       activeJob.status = "error";
       broadcastToTabs({
         type: "CONVERSION_ERROR",
         jobId,
-        error: err instanceof Error ? err.message : "SSE connection failed",
+        error: data.error || "変換中にエラーが発生しました",
       });
       setBadgeText("!");
+      return;
     }
+
+    // Still in progress — update state and broadcast.
+    handleStatusUpdate(data, jobId);
+  } catch (err) {
+    console.error("[service-worker] poll error:", err);
+    // Don't stop polling on transient network errors; keep retrying.
   }
 }
 
-function handleSSEData(
-  data: { step?: string; progress?: number; message?: string },
+function handleStatusUpdate(
+  data: { current_step?: string | null; progress?: number; message?: string | null },
   jobId: string
 ): void {
   if (activeJob?.jobId !== jobId) return;
 
+  // progress is already an integer 0–100 (matches API response).
   const progress = data.progress ?? activeJob.progress;
   activeJob.progress = progress;
 
-  const pct = Math.round(progress * 100);
-  setBadgeText(`${pct}%`);
+  setBadgeText(`${progress}%`);
 
   broadcastToTabs({
     type: "CONVERSION_PROGRESS",
     jobId,
     progress,
-    step: data.step || "",
+    step: data.current_step || "",
     message: data.message || "",
   });
 }
 
-function handleConversionComplete(jobId: string): void {
+function handleConversionComplete(jobId: string, downloadUrl: string | null): void {
   if (activeJob?.jobId === jobId) {
     activeJob.status = "complete";
-    activeJob.progress = 1;
+    activeJob.progress = 100;
+    activeJob.downloadUrl = downloadUrl;
   }
 
   setBadgeText("");
@@ -166,11 +192,12 @@ function handleConversionComplete(jobId: string): void {
   broadcastToTabs({
     type: "CONVERSION_COMPLETE",
     jobId,
+    downloadUrl,
   });
 
   // Store completed job for popup access
   chrome.storage.local.set({
-    lastCompletedJob: { jobId, timestamp: Date.now() },
+    lastCompletedJob: { jobId, downloadUrl, timestamp: Date.now() },
   });
 }
 
@@ -212,6 +239,7 @@ chrome.runtime.onMessage.addListener(
                 arxivUrl: activeJob.arxivUrl,
                 status: activeJob.status,
                 progress: activeJob.progress,
+                downloadUrl: activeJob.downloadUrl,
               }
             : null
         );
@@ -227,12 +255,23 @@ chrome.runtime.onMessage.addListener(
 
       case "DOWNLOAD_RESULT": {
         const jobId = message.jobId as string;
-        getApiUrl().then((apiUrl) => {
-          const downloadUrl = `${apiUrl}/api/v1/jobs/${jobId}/download`;
-          chrome.tabs.create({ url: downloadUrl });
+        // Prefer the download_url from the completed job status response.
+        // Fall back to constructing the local-dev endpoint URL if unavailable.
+        const storedUrl =
+          activeJob?.jobId === jobId ? activeJob.downloadUrl : null;
+
+        if (storedUrl) {
+          chrome.tabs.create({ url: storedUrl });
           sendResponse({ success: true });
-        });
-        return true; // async response
+        } else {
+          getApiUrl().then((apiUrl) => {
+            const fallbackUrl = `${apiUrl}/api/v1/jobs/${jobId}/download`;
+            chrome.tabs.create({ url: fallbackUrl });
+            sendResponse({ success: true });
+          });
+          return true; // async response
+        }
+        return false;
       }
 
       default:
