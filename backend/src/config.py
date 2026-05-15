@@ -32,13 +32,19 @@ class Settings(BaseSettings):
     S3_BUCKET_NAME: str = ""
     S3_PRESIGNED_URL_EXPIRY: int = 3600
 
+    # DynamoDB
+    DYNAMODB_TABLE_NAME: str = "arxiv-translator-jobs"
+    DYNAMODB_ENDPOINT_URL: str = ""
+
+    # Lambda
+    PIPELINE_LAMBDA_NAME: str = ""
+
     # Application
     APP_ENV: str = "development"
     LOG_LEVEL: str = "INFO"
     CORS_ORIGINS: str = "http://localhost:5173"
 
     # Job processing
-    MAX_CONCURRENT_JOBS: int = 10
     JOB_TTL_SECONDS: int = 3600
 
     # Template paths

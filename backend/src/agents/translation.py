@@ -1,55 +1,69 @@
 """TranslationAgent - English to Japanese Markdown translator.
 
-Uses LLM to translate English Markdown content to Japanese while
-maintaining Markdown formatting, structure, and technical terminology.
-Preserves LaTeX math expressions without translation.
+Uses an LLM to translate English Markdown content to Japanese while
+maintaining Markdown structure, math expressions, and technical
+terminology. The agent is configured with the model's maximum output
+token budget so long papers translate end-to-end without silent
+truncation.
 """
 
 from google.adk.agents import LlmAgent
+from google.genai import types as genai_types
 
 _TRANSLATION_INSTRUCTION = """\
 You are a professional English-to-Japanese translator specialising in \
-scientific and technical papers. Translate the provided English Markdown \
-document into natural, publication-quality Japanese.
+scientific and technical papers.
+
+**CRITICAL — Completeness**: Translate the ENTIRE document from its first \
+character to its last. Do NOT omit, summarise, skip, or shorten any \
+section, paragraph, sentence, list item, table cell, caption, footnote, \
+or reference. The title, author list, affiliations, abstract, body \
+sections (in order), conclusions, acknowledgements, appendices, and \
+bibliographic items all must appear in the output. Phrases like \
+"(以下省略)" or "(略)" or "(以下同様)" are forbidden.
 
 ## Translation rules
 
-1. **Markdown syntax**
-   - Keep ALL Markdown formatting exactly as-is: headings (``#``), lists \
-(``-``, ``1.``), bold (``**``), italic (``*``), code (`` ` ``), links, \
-image references (``![alt](path)``).
+1. **Order and structure**
+   - Preserve the exact reading order of the source.
+   - Keep every Markdown element verbatim: headings (``#``, ``##``, …), \
+lists (``-``, ``1.``), bold (``**``), italic (``*``), inline code (`` ` ``), \
+links (``[text](url)``), images (``![alt](path)``), pipe tables.
    - Do not add or remove any Markdown elements.
+   - The heading hierarchy must match the source exactly.
 
 2. **Technical terms**
-   - On the **first occurrence** of a technical term, use the format: \
-``日本語訳(English original)``
+   - On the first occurrence of a domain-specific term, render it as \
+``日本語訳(English original)``.
      - Example: ``自然言語処理(Natural Language Processing)``
    - On subsequent occurrences use only the Japanese term.
-   - Well-known abbreviations (e.g. ``LLM``, ``GPU``, ``API``) may be kept \
-as-is without translation.
+   - Well-known abbreviations (``LLM``, ``GPU``, ``API``, ``BERT``, …) may \
+remain in English.
 
 3. **Mathematical expressions**
-   - Do NOT translate anything inside ``$...$`` or ``$$...$$``.
-   - Do NOT translate variable names, function names, or symbols in equations.
-   - Surrounding explanatory text should be translated normally.
+   - Do NOT translate anything inside ``$...$`` or ``$$...$$`` — keep the \
+LaTeX exactly as given, character for character.
+   - Variable names, function names, and symbols inside math stay as-is.
+   - Explanatory prose around the math IS translated.
 
-4. **Author names and proper nouns**
-   - Keep author names in their original script (typically Latin).
-   - Organisation and conference names may be kept in English if there is no \
-standard Japanese rendering.
+4. **Proper nouns and references**
+   - Author names, affiliations, organisation names, conference names, \
+journal titles stay in their original script.
+   - Email addresses, URLs, citation keys (e.g. ``[Author et al., 2020]``, \
+``[bib.42]``), DOI strings, GitHub paths stay unchanged.
+   - Image paths (``images/figure1.png``) stay unchanged.
 
-5. **Section-by-section processing**
-   - Translate section by section to preserve context and coherence.
-   - Maintain the same heading hierarchy as the source.
+5. **Boilerplate and metadata**
+   - License notices, copyright statements, and "Refer to caption" alt \
+text must also be translated, not skipped.
+   - Author email addresses remain as written.
 
-6. **Citations and references**
-   - Keep citation markers (``[Author et al., Year]``) in English.
-   - Reference list entries should remain in their original language.
+## Output
 
-7. **Output**
-   - Return the full translated Markdown as a single string.
-   - Do not wrap the output in a code fence.
-   - Do not include any commentary or notes outside the translated document.
+Return ONLY the translated Markdown document. Do not include:
+  - any preface like "Here is the translation:" or "翻訳結果:"
+  - any commentary outside the document
+  - any wrapping code fence
 """
 
 
@@ -57,10 +71,11 @@ def create_translation_agent(model: str) -> LlmAgent:
     """Create a TranslationAgent for English-to-Japanese Markdown translation.
 
     Args:
-        model: The LLM model identifier.
+        model: The LLM model identifier (e.g. ``"gemini-2.5-pro"``).
 
     Returns:
-        A configured :class:`LlmAgent`.
+        A configured :class:`LlmAgent` with the model's maximum output
+        token budget allocated so long papers translate without truncation.
     """
     return LlmAgent(
         name="TranslationAgent",
@@ -72,4 +87,10 @@ def create_translation_agent(model: str) -> LlmAgent:
             "technical terminology."
         ),
         output_key="markdown_ja",
+        # Gemini 2.5 Pro supports up to 65,536 output tokens. Defaults are
+        # much lower (often 8,192) which silently truncates long papers —
+        # 50KB of Japanese prose is roughly 25K tokens.
+        generate_content_config=genai_types.GenerateContentConfig(
+            max_output_tokens=65536,
+        ),
     )

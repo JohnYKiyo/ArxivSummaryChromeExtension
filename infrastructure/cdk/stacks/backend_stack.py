@@ -1,273 +1,216 @@
 """Backend stack for the arXiv Translator service.
 
 Creates:
-- ECR repository for the backend Docker image
-- ECS Fargate cluster, task definition, and service
-- Application Load Balancer with 300s idle timeout for SSE
-- CloudWatch log group
-- Proper security group configuration
+- DynamoDB table for job state management
+- Lambda function for API handling (FastAPI via Mangum)
+- Lambda function for pipeline execution
+- API Gateway HTTP API
+- CloudWatch log groups
+- IAM roles and permissions
 """
 
 from aws_cdk import (
     CfnOutput,
     Duration,
     RemovalPolicy,
+    Size,
     Stack,
     Tags,
-    aws_ec2 as ec2,
-    aws_ecr as ecr,
-    aws_ecs as ecs,
-    aws_elasticloadbalancingv2 as elbv2,
+    aws_apigatewayv2 as apigwv2,
+    aws_dynamodb as dynamodb,
     aws_iam as iam,
+    aws_lambda as lambda_,
     aws_logs as logs,
     aws_s3 as s3,
 )
+from aws_cdk.aws_apigatewayv2_integrations import HttpLambdaIntegration
 from constructs import Construct
 
 
 class BackendStack(Stack):
-    """ECS Fargate service behind an ALB for the FastAPI backend."""
+    """Serverless backend: Lambda + API Gateway + DynamoDB."""
 
     def __init__(
         self,
         scope: Construct,
         construct_id: str,
         *,
-        vpc: ec2.IVpc,
         user_pool_id: str,
         user_pool_client_id: str,
         zip_bucket: s3.IBucket,
         cloudfront_domain: str,
-        task_cpu: int = 512,
-        task_memory_mib: int = 1024,
-        desired_count: int = 1,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         # -----------------------------------------------------------
-        # ECR Repository
+        # DynamoDB Table for job state
         # -----------------------------------------------------------
-        self.ecr_repo = ecr.Repository(
+        self.jobs_table = dynamodb.Table(
             self,
-            "BackendRepo",
-            repository_name="arxiv-translator-backend",
+            "JobsTable",
+            table_name="arxiv-translator-jobs",
+            partition_key=dynamodb.Attribute(
+                name="job_id",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=RemovalPolicy.DESTROY,
-            empty_on_delete=True,
-            lifecycle_rules=[
-                ecr.LifecycleRule(
-                    description="Keep last 5 images",
-                    max_image_count=5,
-                    rule_priority=1,
-                ),
-            ],
+            time_to_live_attribute="ttl",
         )
 
-        Tags.of(self.ecr_repo).add("Project", "arxiv-translator")
+        Tags.of(self.jobs_table).add("Project", "arxiv-translator")
 
         # -----------------------------------------------------------
-        # CloudWatch Log Group
+        # Shared Lambda environment variables
         # -----------------------------------------------------------
-        log_group = logs.LogGroup(
+        common_env = {
+            "APP_ENV": "production",
+            "LOG_LEVEL": "INFO",
+            "AWS_REGION_NAME": Stack.of(self).region,
+            "COGNITO_USER_POOL_ID": user_pool_id,
+            "COGNITO_APP_CLIENT_ID": user_pool_client_id,
+            "S3_BUCKET_NAME": zip_bucket.bucket_name,
+            "DYNAMODB_TABLE_NAME": self.jobs_table.table_name,
+            "CORS_ORIGINS": f"https://{cloudfront_domain}",
+        }
+
+        # -----------------------------------------------------------
+        # CloudWatch Log Groups
+        # -----------------------------------------------------------
+        api_log_group = logs.LogGroup(
             self,
-            "BackendLogGroup",
-            log_group_name="/ecs/arxiv-translator-backend",
+            "ApiLogGroup",
+            log_group_name="/lambda/arxiv-translator-api",
+            retention=logs.RetentionDays.TWO_WEEKS,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        pipeline_log_group = logs.LogGroup(
+            self,
+            "PipelineLogGroup",
+            log_group_name="/lambda/arxiv-translator-pipeline",
             retention=logs.RetentionDays.TWO_WEEKS,
             removal_policy=RemovalPolicy.DESTROY,
         )
 
         # -----------------------------------------------------------
-        # ECS Cluster
+        # Pipeline Lambda (long-running, invoked async)
         # -----------------------------------------------------------
-        self.cluster = ecs.Cluster(
+        self.pipeline_lambda = lambda_.Function(
             self,
-            "BackendCluster",
-            cluster_name="arxiv-translator",
-            vpc=vpc,
-            container_insights_v2=ecs.ContainerInsights.DISABLED,
-        )
-
-        # -----------------------------------------------------------
-        # Task Definition
-        # -----------------------------------------------------------
-        task_definition = ecs.FargateTaskDefinition(
-            self,
-            "BackendTaskDef",
-            cpu=task_cpu,
-            memory_limit_mib=task_memory_mib,
-            family="arxiv-translator-backend",
-        )
-
-        # Grant S3 access to the task role
-        zip_bucket.grant_read_write(task_definition.task_role)
-
-        container = task_definition.add_container(
-            "BackendContainer",
-            image=ecs.ContainerImage.from_ecr_repository(self.ecr_repo, tag="latest"),
-            container_name="arxiv-translator-backend",
-            logging=ecs.LogDrivers.aws_logs(
-                stream_prefix="backend",
-                log_group=log_group,
+            "PipelineLambda",
+            function_name="arxiv-translator-pipeline",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="src.pipeline_handler.handler",
+            code=lambda_.Code.from_asset(
+                # Path is relative to where ``cdk synth`` runs (``infrastructure/cdk/``);
+                # the backend source lives at the repository root, two levels up.
+                "../../backend",
+                exclude=["tests", "*.pyc", "__pycache__", ".venv", ".mypy_cache", ".ruff_cache"],
             ),
+            memory_size=1024,
+            timeout=Duration.minutes(15),
+            ephemeral_storage_size=Size.mebibytes(2048),
             environment={
-                "APP_ENV": "production",
-                "LOG_LEVEL": "INFO",
-                "AWS_REGION": Stack.of(self).region,
-                "COGNITO_USER_POOL_ID": user_pool_id,
-                "COGNITO_APP_CLIENT_ID": user_pool_client_id,
-                "S3_BUCKET_NAME": zip_bucket.bucket_name,
-                "CORS_ORIGINS": f"https://{cloudfront_domain}",
+                **common_env,
+                "PIPELINE_LAMBDA_NAME": "",  # Not needed in pipeline Lambda itself
             },
-            health_check=ecs.HealthCheck(
-                command=["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"],
-                interval=Duration.seconds(30),
-                timeout=Duration.seconds(5),
-                retries=3,
-                start_period=Duration.seconds(15),
+            log_group=pipeline_log_group,
+        )
+
+        # -----------------------------------------------------------
+        # API Lambda (short-lived, handles HTTP requests)
+        # -----------------------------------------------------------
+        self.api_lambda = lambda_.Function(
+            self,
+            "ApiLambda",
+            function_name="arxiv-translator-api",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="src.main.handler",
+            code=lambda_.Code.from_asset(
+                # Path is relative to where ``cdk synth`` runs (``infrastructure/cdk/``);
+                # the backend source lives at the repository root, two levels up.
+                "../../backend",
+                exclude=["tests", "*.pyc", "__pycache__", ".venv", ".mypy_cache", ".ruff_cache"],
             ),
-            port_mappings=[
-                ecs.PortMapping(
-                    container_port=8000,
-                    protocol=ecs.Protocol.TCP,
-                ),
-            ],
+            memory_size=256,
+            timeout=Duration.seconds(29),
+            environment={
+                **common_env,
+                "PIPELINE_LAMBDA_NAME": self.pipeline_lambda.function_name,
+            },
+            log_group=api_log_group,
         )
 
         # -----------------------------------------------------------
-        # ALB Security Group
+        # IAM Permissions
         # -----------------------------------------------------------
-        alb_sg = ec2.SecurityGroup(
+
+        # Both Lambdas: DynamoDB read/write
+        self.jobs_table.grant_read_write_data(self.api_lambda)
+        self.jobs_table.grant_read_write_data(self.pipeline_lambda)
+
+        # Both Lambdas: S3 read/write for ZIP files
+        zip_bucket.grant_read_write(self.api_lambda)
+        zip_bucket.grant_read_write(self.pipeline_lambda)
+
+        # API Lambda: invoke pipeline Lambda
+        self.pipeline_lambda.grant_invoke(self.api_lambda)
+
+        # -----------------------------------------------------------
+        # API Gateway HTTP API
+        # -----------------------------------------------------------
+        api_integration = HttpLambdaIntegration(
+            "ApiIntegration",
+            self.api_lambda,
+        )
+
+        self.http_api = apigwv2.HttpApi(
             self,
-            "AlbSecurityGroup",
-            vpc=vpc,
-            description="Security group for arXiv Translator ALB",
-            allow_all_outbound=True,
-        )
-        alb_sg.add_ingress_rule(
-            ec2.Peer.any_ipv4(),
-            ec2.Port.tcp(80),
-            "Allow HTTP",
-        )
-        alb_sg.add_ingress_rule(
-            ec2.Peer.any_ipv4(),
-            ec2.Port.tcp(443),
-            "Allow HTTPS",
-        )
-
-        # -----------------------------------------------------------
-        # ECS Service Security Group
-        # -----------------------------------------------------------
-        service_sg = ec2.SecurityGroup(
-            self,
-            "ServiceSecurityGroup",
-            vpc=vpc,
-            description="Security group for arXiv Translator ECS tasks",
-            allow_all_outbound=True,
-        )
-        service_sg.add_ingress_rule(
-            alb_sg,
-            ec2.Port.tcp(8000),
-            "Allow traffic from ALB",
-        )
-
-        # -----------------------------------------------------------
-        # Application Load Balancer
-        # -----------------------------------------------------------
-        self.alb = elbv2.ApplicationLoadBalancer(
-            self,
-            "BackendAlb",
-            load_balancer_name="arxiv-translator-alb",
-            vpc=vpc,
-            internet_facing=True,
-            security_group=alb_sg,
-            idle_timeout=Duration.seconds(300),  # Required for SSE long connections
-        )
-
-        Tags.of(self.alb).add("Project", "arxiv-translator")
-
-        # -----------------------------------------------------------
-        # Fargate Service
-        # -----------------------------------------------------------
-        self.service = ecs.FargateService(
-            self,
-            "BackendService",
-            service_name="arxiv-translator-backend",
-            cluster=self.cluster,
-            task_definition=task_definition,
-            desired_count=desired_count,
-            assign_public_ip=False,
-            security_groups=[service_sg],
-            vpc_subnets=ec2.SubnetSelection(
-                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
+            "HttpApi",
+            api_name="arxiv-translator-api",
+            cors_preflight=apigwv2.CorsPreflightOptions(
+                allow_origins=[f"https://{cloudfront_domain}", "http://localhost:5173"],
+                allow_methods=[apigwv2.CorsHttpMethod.ANY],
+                allow_headers=["*"],
+                max_age=Duration.hours(1),
             ),
-            health_check_grace_period=Duration.seconds(60),
         )
 
-        # -----------------------------------------------------------
-        # ALB Target Group + Listener
-        # -----------------------------------------------------------
-        target_group = elbv2.ApplicationTargetGroup(
-            self,
-            "BackendTargetGroup",
-            target_group_name="arxiv-translator-tg",
-            vpc=vpc,
-            port=8000,
-            protocol=elbv2.ApplicationProtocol.HTTP,
-            target_type=elbv2.TargetType.IP,
-            health_check=elbv2.HealthCheck(
-                path="/api/v1/health",
-                port="8000",
-                protocol=elbv2.Protocol.HTTP,
-                healthy_threshold_count=2,
-                unhealthy_threshold_count=3,
-                interval=Duration.seconds(30),
-                timeout=Duration.seconds(10),
-            ),
-            deregistration_delay=Duration.seconds(30),
+        self.http_api.add_routes(
+            path="/api/v1/{proxy+}",
+            methods=[apigwv2.HttpMethod.ANY],
+            integration=api_integration,
         )
 
-        target_group.add_target(self.service)
-
-        # HTTP listener
-        self.alb.add_listener(
-            "HttpListener",
-            port=80,
-            default_target_groups=[target_group],
-        )
+        Tags.of(self.http_api).add("Project", "arxiv-translator")
 
         # -----------------------------------------------------------
         # Outputs
         # -----------------------------------------------------------
         CfnOutput(
             self,
-            "EcrRepositoryUri",
-            value=self.ecr_repo.repository_uri,
-            description="ECR repository URI for backend image",
-            export_name="ArxivTranslatorEcrUri",
+            "ApiUrl",
+            value=self.http_api.url or "",
+            description="API Gateway URL (backend API endpoint)",
+            export_name="ArxivTranslatorApiUrl",
         )
         CfnOutput(
             self,
-            "AlbDnsName",
-            value=self.alb.load_balancer_dns_name,
-            description="ALB DNS name (backend API endpoint)",
-            export_name="ArxivTranslatorAlbDns",
+            "ApiLambdaName",
+            value=self.api_lambda.function_name,
+            description="API Lambda function name",
         )
         CfnOutput(
             self,
-            "AlbUrl",
-            value=f"http://{self.alb.load_balancer_dns_name}",
-            description="Backend API base URL",
-            export_name="ArxivTranslatorAlbUrl",
+            "PipelineLambdaName",
+            value=self.pipeline_lambda.function_name,
+            description="Pipeline Lambda function name",
         )
         CfnOutput(
             self,
-            "EcsClusterName",
-            value=self.cluster.cluster_name,
-            description="ECS cluster name",
-        )
-        CfnOutput(
-            self,
-            "EcsServiceName",
-            value=self.service.service_name,
-            description="ECS service name",
+            "DynamoDbTableName",
+            value=self.jobs_table.table_name,
+            description="DynamoDB table name for job state",
         )

@@ -5,21 +5,20 @@
 #
 # Usage:
 #   ./infrastructure/deploy.sh              # Full deploy (all steps)
-#   ./infrastructure/deploy.sh --backend    # Build & push Docker image + deploy CDK
+#   ./infrastructure/deploy.sh --backend    # Deploy CDK + update Lambda code
 #   ./infrastructure/deploy.sh --frontend   # Upload frontend to S3 + invalidate CF
-#   ./infrastructure/deploy.sh --cdk-only   # Deploy CDK stacks only (no Docker/frontend)
+#   ./infrastructure/deploy.sh --cdk-only   # Deploy CDK stacks only
 #
 # Prerequisites:
 #   - AWS CLI configured with appropriate credentials
 #   - AWS CDK CLI installed (npm install -g aws-cdk)
-#   - Docker installed and running
 #   - Node.js / npm (for frontend build)
 #   - Python 3.12+ with pip
 #
 # Environment variables (optional overrides):
 #   AWS_REGION          - AWS region (default: ap-northeast-1)
 #   AWS_ACCOUNT_ID      - AWS account ID (auto-detected if not set)
-#   GOOGLE_API_KEY      - Google API key (must be set for backend runtime)
+#   GOOGLE_API_KEY      - Google API key (must be set for Lambda runtime)
 # =============================================================================
 
 set -euo pipefail
@@ -30,7 +29,6 @@ CDK_DIR="${SCRIPT_DIR}/cdk"
 
 AWS_REGION="${AWS_REGION:-ap-northeast-1}"
 AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")}"
-ECR_REPO_NAME="arxiv-translator-backend"
 
 # Colors for output
 RED='\033[0;31m'
@@ -49,7 +47,6 @@ check_prerequisites() {
     local missing=()
     command -v aws   >/dev/null 2>&1 || missing+=("aws-cli")
     command -v cdk   >/dev/null 2>&1 || missing+=("aws-cdk")
-    command -v docker >/dev/null 2>&1 || missing+=("docker")
     command -v python3 >/dev/null 2>&1 || missing+=("python3")
 
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -87,7 +84,7 @@ bootstrap_cdk() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 3: Deploy CDK stacks
+# Step 3: Deploy CDK stacks (Lambda + API Gateway + DynamoDB)
 # ---------------------------------------------------------------------------
 deploy_cdk() {
     log_info "Deploying CDK stacks..."
@@ -98,32 +95,41 @@ deploy_cdk() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 4: Build and push Docker image to ECR
+# Step 4: Set Google API Key as Lambda env var
 # ---------------------------------------------------------------------------
-build_and_push_docker() {
-    local ecr_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
+set_lambda_env() {
+    if [[ -z "${GOOGLE_API_KEY:-}" ]]; then
+        log_warn "GOOGLE_API_KEY not set. Lambda functions will need it configured manually."
+        return
+    fi
 
-    log_info "Logging in to ECR..."
-    aws ecr get-login-password --region "${AWS_REGION}" \
-        | docker login --username AWS --password-stdin \
-          "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    log_info "Updating Lambda environment variables..."
 
-    log_info "Building Docker image..."
-    docker build -t "${ECR_REPO_NAME}:latest" "${PROJECT_ROOT}/backend"
+    for fn_name in arxiv-translator-api arxiv-translator-pipeline; do
+        # Get current env vars and merge with GOOGLE_API_KEY
+        local current_env
+        current_env=$(aws lambda get-function-configuration \
+            --function-name "${fn_name}" \
+            --region "${AWS_REGION}" \
+            --query 'Environment.Variables' \
+            --output json 2>/dev/null || echo '{}')
 
-    log_info "Tagging and pushing image to ECR..."
-    docker tag "${ECR_REPO_NAME}:latest" "${ecr_uri}:latest"
-    docker push "${ecr_uri}:latest"
+        local updated_env
+        updated_env=$(python3 -c "
+import json, sys
+env = json.loads('${current_env}')
+env['GOOGLE_API_KEY'] = '${GOOGLE_API_KEY}'
+print(json.dumps({'Variables': env}))
+")
 
-    log_info "Forcing ECS service update..."
-    aws ecs update-service \
-        --cluster arxiv-translator \
-        --service arxiv-translator-backend \
-        --force-new-deployment \
-        --region "${AWS_REGION}" \
-        >/dev/null
+        aws lambda update-function-configuration \
+            --function-name "${fn_name}" \
+            --environment "${updated_env}" \
+            --region "${AWS_REGION}" \
+            >/dev/null
+    done
 
-    log_info "Docker image pushed and ECS service updated."
+    log_info "Lambda environment variables updated."
 }
 
 # ---------------------------------------------------------------------------
@@ -202,7 +208,7 @@ main() {
         --backend)
             bootstrap_cdk
             deploy_cdk
-            build_and_push_docker
+            set_lambda_env
             ;;
         --frontend)
             deploy_frontend
@@ -214,7 +220,7 @@ main() {
         full|*)
             bootstrap_cdk
             deploy_cdk
-            build_and_push_docker
+            set_lambda_env
             deploy_frontend
             ;;
     esac

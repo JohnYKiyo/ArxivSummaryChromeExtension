@@ -2,24 +2,28 @@
 
 Defines the following endpoints:
 - POST /api/v1/convert - Create a new conversion job
-- GET /api/v1/jobs/{job_id}/stream - SSE progress stream
-- GET /api/v1/jobs/{job_id}/download - Download ZIP result
+- GET /api/v1/jobs/{job_id}/status - Poll job progress
+- GET /api/v1/jobs/{job_id}/download - Download the ZIP (local dev only)
 - GET /api/v1/health - Health check
+
+This module deliberately knows nothing about ``boto3``, ``asyncio``, or
+the pipeline implementation. Pipeline dispatch goes through the injected
+:class:`PipelineDispatcher`; persistence goes through the injected
+:class:`JobManager`. See ``services/pipeline_dispatcher.py``.
 """
 
-import asyncio
 import logging
-import re
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, field_validator
-from sse_starlette.sse import EventSourceResponse
 
 from src.api.auth import get_current_user
-from src.services.job_manager import JobManager, JobStatus
-from src.services.sse import EventBus
+from src.config import get_settings
+from src.models.api import ConvertRequest, ConvertResponse, ErrorResponse, HealthResponse, StatusResponse
+from src.services.job_manager import JobManager
+from src.services.pipeline_dispatcher import PipelineDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -28,23 +32,21 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _job_manager: JobManager | None = None
-_event_bus: EventBus | None = None
-
-_ARXIV_URL_PATTERN = re.compile(r"^https?://(www\.)?arxiv\.org/(abs|pdf|html)/\d{4}\.\d{4,5}(v\d+)?$")
+_dispatcher: PipelineDispatcher | None = None
 
 
-def init_routes(job_manager: JobManager, event_bus: EventBus) -> None:
+def init_routes(job_manager: JobManager, dispatcher: PipelineDispatcher) -> None:
     """Inject shared service instances into the routes module.
 
     Called once during application startup from ``main.py``.
 
     Args:
         job_manager: The application-wide :class:`JobManager`.
-        event_bus: The application-wide :class:`EventBus`.
+        dispatcher: The strategy used to start a pipeline run for a job.
     """
-    global _job_manager, _event_bus  # noqa: PLW0603
+    global _job_manager, _dispatcher  # noqa: PLW0603
     _job_manager = job_manager
-    _event_bus = event_bus
+    _dispatcher = dispatcher
 
 
 def _get_job_manager() -> JobManager:
@@ -54,51 +56,11 @@ def _get_job_manager() -> JobManager:
     return _job_manager
 
 
-def _get_event_bus() -> EventBus:
-    """Return the shared EventBus, raising if not initialized."""
-    if _event_bus is None:
-        raise RuntimeError("EventBus not initialized; call init_routes first")
-    return _event_bus
-
-
-# ---------------------------------------------------------------------------
-# Request / Response models
-# ---------------------------------------------------------------------------
-
-
-class ConvertRequest(BaseModel):
-    """Request body for the ``POST /convert`` endpoint."""
-
-    arxiv_url: str
-
-    @field_validator("arxiv_url")
-    @classmethod
-    def validate_arxiv_url(cls, v: str) -> str:
-        if not _ARXIV_URL_PATTERN.match(v):
-            msg = "Invalid arXiv URL. Expected format: https://arxiv.org/abs/YYMM.NNNNN"
-            raise ValueError(msg)
-        return v
-
-
-class ConvertResponse(BaseModel):
-    """Response body for a successfully accepted conversion job."""
-
-    job_id: str
-    status: str
-    stream_url: str
-
-
-class HealthResponse(BaseModel):
-    """Response body for the health check endpoint."""
-
-    status: str
-    version: str
-
-
-class ErrorResponse(BaseModel):
-    """Standard error response body."""
-
-    detail: str
+def _get_dispatcher() -> PipelineDispatcher:
+    """Return the shared PipelineDispatcher, raising if not initialized."""
+    if _dispatcher is None:
+        raise RuntimeError("PipelineDispatcher not initialized; call init_routes first")
+    return _dispatcher
 
 
 # ---------------------------------------------------------------------------
@@ -120,71 +82,37 @@ async def create_conversion(
 ) -> ConvertResponse:
     """Create a new arXiv paper conversion job.
 
-    Validates the URL, creates a job record, and launches the
-    translation pipeline as a background task.
-
-    Returns 202 Accepted with the job ID and SSE stream URL.
+    Validates the URL, creates a job record in DynamoDB, and asks the
+    dispatcher to start the pipeline. Returns 202 Accepted with the job
+    ID and status polling URL.
     """
     job_manager = _get_job_manager()
-    event_bus = _get_event_bus()
+    dispatcher = _get_dispatcher()
 
     job = await job_manager.create_job(body.arxiv_url)
-
-    # Import here to avoid circular imports at module level.
-    from src.agents.orchestrator import run_pipeline
-
-    asyncio.create_task(
-        _run_pipeline_task(job.job_id, body.arxiv_url, job_manager, event_bus, run_pipeline),
-    )
+    await dispatcher.dispatch(job.job_id, body.arxiv_url)
 
     return ConvertResponse(
         job_id=job.job_id,
         status="accepted",
-        stream_url=f"/api/v1/jobs/{job.job_id}/stream",
+        status_url=f"/api/v1/jobs/{job.job_id}/status",
     )
 
 
-async def _run_pipeline_task(
-    job_id: str,
-    arxiv_url: str,
-    job_manager: JobManager,
-    event_bus: EventBus,
-    run_pipeline: Any,
-) -> None:
-    """Wrapper that runs the pipeline and handles final cleanup.
-
-    The orchestrator's ``run_pipeline`` already manages job status
-    updates, SSE events, and event bus cleanup internally.
-    This wrapper only catches unexpected errors that escape the
-    orchestrator's own error handling.
-    """
-    try:
-        await run_pipeline(
-            arxiv_url=arxiv_url,
-            job_id=job_id,
-            event_bus=event_bus,
-            job_manager=job_manager,
-        )
-    except Exception:
-        logger.exception("Pipeline task failed for job %s", job_id)
-        # Orchestrator should have already handled this, but just in case
-        job = await job_manager.get_job(job_id)
-        if job and job.status != JobStatus.ERROR:
-            await job_manager.set_error(job_id, "Pipeline execution failed")
-
-
-@router.get("/jobs/{job_id}/stream")
-async def stream_job_progress(
+@router.get(
+    "/jobs/{job_id}/status",
+    response_model=StatusResponse,
+    responses={404: {"model": ErrorResponse}},
+)
+async def get_job_status(
     job_id: str,
     _user: dict[str, Any] = Depends(get_current_user),
-) -> EventSourceResponse:
-    """Stream real-time progress events for a conversion job via SSE.
+) -> StatusResponse:
+    """Poll the current status of a conversion job.
 
-    The stream terminates when the job reaches a terminal state
-    (completed or error) or the client disconnects.
+    Returns the job's progress, current step, and download URL when complete.
     """
     job_manager = _get_job_manager()
-    event_bus = _get_event_bus()
 
     job = await job_manager.get_job(job_id)
     if job is None:
@@ -193,31 +121,39 @@ async def stream_job_progress(
             detail=f"Job not found: {job_id}",
         )
 
-    async def event_generator():  # noqa: ANN202
-        async for event in event_bus.subscribe(job_id):
-            yield {
-                "event": event.event,
-                "data": event.to_sse_string().split("data: ", 1)[1].split("\n")[0],
-            }
-
-    return EventSourceResponse(event_generator())
+    return StatusResponse(
+        job_id=job.job_id,
+        status=job.status,
+        current_step=job.current_step,
+        progress=job.progress,
+        message=job.message,
+        error=job.error,
+        download_url=job.download_url,
+    )
 
 
 @router.get(
     "/jobs/{job_id}/download",
-    responses={
-        404: {"model": ErrorResponse},
-    },
+    responses={404: {"model": ErrorResponse}},
 )
 async def download_job_result(
     job_id: str,
     _user: dict[str, Any] = Depends(get_current_user),
 ) -> FileResponse:
-    """Download the ZIP result of a completed conversion job.
+    """Download the ZIP result of a completed job (local development only).
 
-    Returns 404 if the job does not exist or has not completed.
+    In production, the frontend downloads directly from the S3 presigned URL
+    stored in ``download_url``. This endpoint exists only for local development
+    where ``S3_BUCKET_NAME`` is not set and the ZIP is kept on disk.
     """
     job_manager = _get_job_manager()
+    settings = get_settings()
+
+    if settings.S3_BUCKET_NAME:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Direct download not available in production; use the presigned URL from /status",
+        )
 
     job = await job_manager.get_job(job_id)
     if job is None:
@@ -226,19 +162,21 @@ async def download_job_result(
             detail=f"Job not found: {job_id}",
         )
 
-    if job.status != JobStatus.COMPLETED or job.result is None:
+    if job.local_result_path is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job {job_id} has not completed yet or has no result",
+            detail=f"Job {job_id} has no local result (not yet completed or result was deleted)",
         )
 
-    result_path = job.result
+    result_path = Path(job.local_result_path)
     if not result_path.exists():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Result file no longer available",
         )
 
+    # Use the on-disk filename (which the pipeline writes as
+    # ``<arxiv_id>.zip``) so the user's browser downloads under that name.
     return FileResponse(
         path=result_path,
         media_type="application/zip",
