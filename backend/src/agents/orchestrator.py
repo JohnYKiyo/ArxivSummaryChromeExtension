@@ -1,8 +1,15 @@
 """Pipeline orchestrator for the arXiv translation workflow.
 
 Coordinates the execution of all agents in the translation pipeline:
-fetch_arxiv_paper -> Tex2MarkdownAgent -> TranslationAgent -> SummaryAgent.
-Reports progress via DynamoDB updates at each stage transition.
+
+    fetch_arxiv_paper -> (Tex2MarkdownAgent OR html_to_markdown) ->
+        TranslationAgent -> SummaryAgent
+
+The first conversion step branches on the format returned by
+``fetch_arxiv_paper``: HTML papers (preferred when available) are converted
+deterministically with the ``markdownify`` library; TeX-only papers use
+the ``Tex2MarkdownAgent`` LLM. The downstream stages (translation,
+summary, packaging) are identical for both.
 
 Each agent is run independently with its own InMemoryRunner so that
 DynamoDB progress writes can be interleaved between stages and
@@ -25,7 +32,8 @@ from src.agents.tex2markdown import create_tex2markdown_agent
 from src.agents.translation import create_translation_agent
 from src.config import get_settings
 from src.models.job import JobStatus
-from src.tools.arxiv import fetch_arxiv_paper
+from src.tools.arxiv import PdfOnlyPaperError, fetch_arxiv_paper
+from src.tools.html_to_markdown import html_to_markdown
 from src.tools.packaging import create_zip_package, upload_to_s3
 
 if TYPE_CHECKING:
@@ -52,14 +60,29 @@ STAGES = [
 
 
 async def _extract_final_text_async(event_stream: Any) -> str:
-    """Walk an async event stream and return the last text content produced."""
-    final_text = ""
+    """Walk an ADK event stream and return the agent's full text output.
+
+    ADK emits several events during one agent turn — short "thinking" notes,
+    streaming deltas, and the final full answer. Earlier code captured only
+    the *last* event, which for some models is a brief wrap-up rather than
+    the answer itself, leaving us with a truncated result. Keeping the
+    *longest* text seen is a robust heuristic: thinking notes are typically
+    one or two short sentences, while the final answer is orders of
+    magnitude larger.
+    """
+    longest_text = ""
+    event_count = 0
     async for event in event_stream:
+        event_count += 1
         if event.content and event.content.parts:
             for part in event.content.parts:
-                if hasattr(part, "text") and part.text:
-                    final_text = part.text
-    return final_text
+                text = getattr(part, "text", None)
+                if text:
+                    logger.debug("Agent event #%d: text length=%d", event_count, len(text))
+                    if len(text) > len(longest_text):
+                        longest_text = text
+    logger.info("Agent emitted %d events; final output: %d chars", event_count, len(longest_text))
+    return longest_text
 
 
 async def _run_single_agent(
@@ -163,24 +186,34 @@ async def run_pipeline(
     }
 
     try:
-        # ---- Stage 0: Fetch TeX ----
+        # ---- Stage 0: Fetch source (HTML preferred, TeX fallback) ----
         await _publish_progress(job_manager, job_id, 0)
 
         # Fetch directly — no LLM needed for downloading/extracting files.
-        tex_content, image_paths, work_dir = fetch_arxiv_paper(arxiv_url)
-        image_paths_str = "\n".join(str(p) for p in image_paths)
+        paper = fetch_arxiv_paper(arxiv_url)
+        work_dir = paper.work_dir
 
-        # ---- Stage 1: TeX -> Markdown ----
+        # ---- Stage 1: Source -> Markdown ----
         await _publish_progress(job_manager, job_id, 1)
-        tex2md_agent = create_tex2markdown_agent(model)
-        markdown_en = await _run_single_agent(
-            tex2md_agent,
-            (
-                f"Convert the following TeX content to Markdown.\n\n"
-                f"Image paths available:\n{image_paths_str}\n\n"
-                f"TeX content:\n{tex_content}"
-            ),
-        )
+        if paper.kind == "html":
+            # arxiv.org/html is well-structured — convert deterministically
+            # via the markdownify library, no LLM needed.
+            base_url = f"https://arxiv.org/html/{paper.arxiv_id}/"
+            markdown_en = html_to_markdown(paper.content, base_url=base_url)
+            logger.info("HTML → Markdown converted (%d chars) without LLM", len(markdown_en))
+        else:
+            # TeX source — needs the LLM agent to convert structure, math,
+            # citations, etc. into clean Markdown.
+            image_paths_str = "\n".join(str(p) for p in paper.images)
+            tex2md_agent = create_tex2markdown_agent(model)
+            markdown_en = await _run_single_agent(
+                tex2md_agent,
+                (
+                    f"Convert the following TeX content to Markdown.\n\n"
+                    f"Image paths available:\n{image_paths_str}\n\n"
+                    f"TeX content:\n{paper.content}"
+                ),
+            )
         results["markdown_en"] = markdown_en
 
         # ---- Stage 2: Translation ----
@@ -207,7 +240,7 @@ async def run_pipeline(
             paper_en_md=markdown_en,
             paper_ja_md=markdown_ja,
             summary_ja_md=summary_ja,
-            image_paths=image_paths,
+            image_paths=paper.images,
             work_dir=work_dir,
         )
 
@@ -231,6 +264,18 @@ async def run_pipeline(
             await job_manager.set_result(job_id, download_url, local_result_path=local_path)
 
         logger.info("Pipeline [%s] completed successfully", job_id)
+
+    except PdfOnlyPaperError as exc:
+        # Friendly, actionable message for the common "only-PDF" case.
+        # We surface this through DynamoDB; don't re-raise so the background
+        # task doesn't generate a noisy traceback for an expected condition.
+        logger.warning("Pipeline [%s] aborted: PDF-only paper (%s)", job_id, exc)
+        if job_manager is not None:
+            await job_manager.set_error(
+                job_id,
+                "この論文は PDF 版のみ提供されており、HTML/TeX ソースがないため変換できません。",
+            )
+        return results
 
     except Exception:
         logger.exception("Pipeline [%s] failed", job_id)

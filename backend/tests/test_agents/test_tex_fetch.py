@@ -1,21 +1,30 @@
-"""Tests for the TexFetchAgent.
+"""Tests for arXiv source fetching and extraction.
 
-Verifies arXiv source downloading, tar.gz extraction,
-and correct identification of .tex and image files.
+Covers the four behaviours the orchestrator depends on:
+
+1. ``extract_arxiv_id`` URL parsing.
+2. ``extract_source`` for tar.gz and single-.tex submissions, including
+   the multi-file main-TeX selection and ``\\input`` expansion.
+3. ``fetch_arxiv_paper`` HTTP integration: HTML-first, TeX fallback,
+   PDF-only error.
 """
 
 from __future__ import annotations
 
 import io
 import tarfile
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.tools.arxiv import extract_arxiv_id, extract_source, fetch_arxiv_paper
-
+from src.tools.arxiv import (
+    PaperSource,
+    PdfOnlyPaperError,
+    extract_arxiv_id,
+    extract_source,
+    fetch_arxiv_paper,
+)
 
 # ---------------------------------------------------------------------------
 # extract_arxiv_id
@@ -35,13 +44,10 @@ class TestExtractArxivId:
             ("https://arxiv.org/html/2305.54321", "2305.54321"),
             ("https://arxiv.org/html/2305.54321v3", "2305.54321v3"),
             ("https://arxiv.org/e-print/2301.00001", "2301.00001"),
-            # Bare IDs
             ("2301.00001", "2301.00001"),
             ("2301.00001v2", "2301.00001v2"),
-            # IDs with 5-digit second part
             ("https://arxiv.org/abs/2401.12345", "2401.12345"),
             ("2401.12345", "2401.12345"),
-            # URL with trailing path or query
             ("https://arxiv.org/abs/2301.00001?context=cs", "2301.00001"),
         ],
     )
@@ -56,7 +62,7 @@ class TestExtractArxivId:
             "not-a-url",
             "",
             "https://arxiv.org/list/cs.AI/recent",
-            "12345",  # not in YYMM.NNNNN format
+            "12345",
         ],
     )
     def test_invalid_urls(self, url: str) -> None:
@@ -70,7 +76,7 @@ class TestExtractArxivId:
 
 
 def _create_tar_gz(output_path: Path, files: dict[str, str]) -> Path:
-    """Helper: create a tar.gz archive with the given filename->content map."""
+    """Helper: create a tar.gz archive from a {name -> content} map."""
     tar_path = output_path / "test.tar.gz"
     with tarfile.open(tar_path, "w:gz") as tar:
         for name, content in files.items():
@@ -108,18 +114,57 @@ class TestExtractSource:
         assert r"\documentclass" in content
         assert "Main" in content
 
+    def test_main_tex_selection_prefers_begin_document(self, tmp_path: Path) -> None:
+        """Files with both \\documentclass and \\begin{document} win over class-only."""
+        files = {
+            # Shared preamble with documentclass but no \begin{document}
+            "preamble.tex": (
+                r"\documentclass{article} " + ("padding " * 200)
+            ),
+            # Real main file: both markers, smaller in size
+            "paper.tex": (
+                r"\documentclass{article}\begin{document}Real body\end{document}"
+            ),
+        }
+        tar_path = _create_tar_gz(tmp_path, files)
+        extract_dir = tmp_path / "extracted"
+        extract_dir.mkdir()
+
+        content, _ = extract_source(tar_path, extract_dir)
+        assert "Real body" in content
+        assert "padding" not in content
+
+    def test_input_directive_is_expanded(self, tmp_path: Path) -> None:
+        """\\input{chapter} should pull the referenced file inline."""
+        files = {
+            "main.tex": (
+                r"\documentclass{article}\begin{document}"
+                r"Intro paragraph.\input{chapter1}\end{document}"
+            ),
+            "chapter1.tex": "Chapter one content here.",
+        }
+        tar_path = _create_tar_gz(tmp_path, files)
+        extract_dir = tmp_path / "extracted"
+        extract_dir.mkdir()
+
+        content, _ = extract_source(tar_path, extract_dir)
+        assert "Intro paragraph" in content
+        assert "Chapter one content here." in content
+        # The \input directive itself should be gone (expanded away).
+        assert r"\input{chapter1}" not in content
+
     def test_tar_gz_with_images(self, tmp_path: Path) -> None:
         """Image files in the archive should be returned in image_paths."""
         tar_path = tmp_path / "test.tar.gz"
         with tarfile.open(tar_path, "w:gz") as tar:
-            # Add a TeX file
-            tex_data = r"\documentclass{article}\begin{document}Hi\end{document}".encode()
+            tex_data = (
+                r"\documentclass{article}\begin{document}Hi\end{document}".encode()
+            )
             tex_info = tarfile.TarInfo(name="paper.tex")
             tex_info.size = len(tex_data)
             tar.addfile(tex_info, io.BytesIO(tex_data))
 
-            # Add an image file
-            img_data = b"\x89PNG\r\n\x1a\n"  # PNG magic bytes
+            img_data = b"\x89PNG\r\n\x1a\n"
             img_info = tarfile.TarInfo(name="figures/fig1.png")
             img_info.size = len(img_data)
             tar.addfile(img_info, io.BytesIO(img_data))
@@ -141,51 +186,118 @@ class TestExtractSource:
         with pytest.raises(FileNotFoundError, match="No .tex files"):
             extract_source(tar_path, extract_dir)
 
+    def test_includepdf_wrapper_raises_pdf_only(self, tmp_path: Path) -> None:
+        """A TeX file that just \\includepdf a PDF is treated as PDF-only."""
+        files = {
+            "wrapper.tex": (
+                r"\documentclass{article}\usepackage{pdfpages}"
+                r"\begin{document}\includepdf[pages=1-last]{paper.pdf}\end{document}"
+            ),
+        }
+        tar_path = _create_tar_gz(tmp_path, files)
+        extract_dir = tmp_path / "extracted"
+        extract_dir.mkdir()
+
+        with pytest.raises(PdfOnlyPaperError, match=r"includepdf|PDF-only"):
+            extract_source(tar_path, extract_dir)
+
+    def test_include_directive_is_expanded(self, tmp_path: Path) -> None:
+        """\\include{...} (not just \\input) should also be expanded."""
+        files = {
+            "main.tex": (
+                r"\documentclass{article}\begin{document}"
+                r"\include{section}\end{document}"
+            ),
+            "section.tex": "Included section content",
+        }
+        tar_path = _create_tar_gz(tmp_path, files)
+        extract_dir = tmp_path / "extracted"
+        extract_dir.mkdir()
+
+        content, _ = extract_source(tar_path, extract_dir)
+        assert "Included section content" in content
+        assert r"\include{section}" not in content
+
 
 # ---------------------------------------------------------------------------
 # fetch_arxiv_paper (integration with mocked HTTP)
 # ---------------------------------------------------------------------------
 
 
-class TestFetchArxivPaper:
-    """Test the high-level fetch_arxiv_paper function with mocked HTTP."""
+def _mock_response(*, status: int = 200, content: bytes = b"", content_type: str = "") -> MagicMock:
+    """Build a mock requests.Response with the given status / body / content-type."""
+    response = MagicMock()
+    response.status_code = status
+    response.content = content
+    response.text = content.decode("utf-8", errors="replace") if content else ""
+    response.headers = {"Content-Type": content_type}
+    if status >= 400:
+        response.raise_for_status = MagicMock(side_effect=Exception(f"HTTP {status}"))
+    else:
+        response.raise_for_status = MagicMock()
+    return response
 
-    def test_fetch_with_mocked_response(self, tmp_path: Path) -> None:
-        """Mocked HTTP download should produce a valid extraction."""
-        # Build a tar.gz in-memory
+
+class TestFetchArxivPaper:
+    """Behaviour of the HTML-first, TeX-fallback ``fetch_arxiv_paper``."""
+
+    def test_html_version_is_preferred(self) -> None:
+        """When the HTML endpoint returns 200 HTML, that path is used."""
+        html_body = b"<!DOCTYPE html><html><body><p>Hello arXiv</p></body></html>"
+        html_response = _mock_response(content=html_body, content_type="text/html")
+
+        with patch("src.tools.arxiv.requests.get", return_value=html_response) as mocked:
+            paper = fetch_arxiv_paper("https://arxiv.org/abs/2301.00001")
+
+        assert isinstance(paper, PaperSource)
+        assert paper.kind == "html"
+        assert "Hello arXiv" in paper.content
+        assert paper.images == []
+        # Only the HTML endpoint should have been called.
+        assert mocked.call_count == 1
+
+    def test_falls_back_to_tex_when_html_missing(self) -> None:
+        """A 404 from the HTML endpoint causes fallback to the TeX e-print."""
+        # First call: HTML returns 404. Second call: TeX e-print succeeds.
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            tex_data = r"\documentclass{article}\begin{document}Hello\end{document}".encode()
+            tex_data = (
+                r"\documentclass{article}\begin{document}Hello\end{document}".encode()
+            )
             info = tarfile.TarInfo(name="paper.tex")
             info.size = len(tex_data)
             tar.addfile(info, io.BytesIO(tex_data))
         tar_bytes = buf.getvalue()
 
-        mock_response = MagicMock()
-        mock_response.content = tar_bytes
-        mock_response.headers = {"Content-Type": "application/gzip"}
-        mock_response.raise_for_status = MagicMock()
+        html_404 = _mock_response(status=404, content_type="text/html")
+        tex_response = _mock_response(content=tar_bytes, content_type="application/gzip")
 
-        with patch("src.tools.arxiv.requests.get", return_value=mock_response):
-            tex_content, image_paths, work_dir = fetch_arxiv_paper(
-                "https://arxiv.org/abs/2301.00001"
-            )
+        with patch("src.tools.arxiv.requests.get", side_effect=[html_404, tex_response]):
+            paper = fetch_arxiv_paper("https://arxiv.org/abs/2301.00001")
 
-        assert r"\documentclass" in tex_content
-        assert isinstance(image_paths, list)
-        assert Path(work_dir).exists()
+        assert paper.kind == "tex"
+        assert r"\documentclass" in paper.content
 
-    def test_fetch_single_tex_response(self, tmp_path: Path) -> None:
-        """A text/plain response (single-file submission) should work."""
+    def test_single_tex_file_response(self) -> None:
+        """A text/plain e-print (single-file submission) should work as TeX."""
         tex_data = r"\documentclass{article}\begin{document}Single\end{document}"
+        html_404 = _mock_response(status=404)
+        tex_response = _mock_response(content=tex_data.encode(), content_type="text/plain")
 
-        mock_response = MagicMock()
-        mock_response.content = tex_data.encode("utf-8")
-        mock_response.headers = {"Content-Type": "text/plain"}
-        mock_response.raise_for_status = MagicMock()
+        with patch("src.tools.arxiv.requests.get", side_effect=[html_404, tex_response]):
+            paper = fetch_arxiv_paper("2301.00001")
 
-        with patch("src.tools.arxiv.requests.get", return_value=mock_response):
-            tex_content, image_paths, work_dir = fetch_arxiv_paper("2301.00001")
+        assert paper.kind == "tex"
+        assert "Single" in paper.content
+        assert paper.images == []
 
-        assert "Single" in tex_content
-        assert image_paths == []
+    def test_pdf_only_paper_raises(self) -> None:
+        """A PDF-typed e-print response should raise PdfOnlyPaperError."""
+        html_404 = _mock_response(status=404)
+        pdf_response = _mock_response(content=b"%PDF-1.5\n", content_type="application/pdf")
+
+        with (
+            patch("src.tools.arxiv.requests.get", side_effect=[html_404, pdf_response]),
+            pytest.raises(PdfOnlyPaperError, match="PDF"),
+        ):
+            fetch_arxiv_paper("2301.00001")
