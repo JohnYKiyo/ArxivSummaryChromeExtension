@@ -45,6 +45,12 @@ _EPRINT_URL = "https://arxiv.org/e-print/{arxiv_id}"
 # Recognise ``\input{path}`` and ``\include{path}`` (no nesting).
 _INPUT_DIRECTIVE = re.compile(r"\\(?:input|include)\{([^{}]+)\}")
 
+# Recognise ``\bibliography{name}`` (single or comma-separated names) and
+# ``\bibliographystyle{...}``. The first is replaced with a .bbl include;
+# the second is stripped because pandoc doesn't use it.
+_BIBLIOGRAPHY_DIRECTIVE = re.compile(r"\\bibliography\{([^{}]+)\}")
+_BIBLIOGRAPHYSTYLE_DIRECTIVE = re.compile(r"\\bibliographystyle\{[^{}]*\}")
+
 # Max recursion depth for \input expansion (defensive — sane TeX trees
 # rarely nest more than 3 deep).
 _MAX_INPUT_DEPTH = 10
@@ -336,12 +342,21 @@ def _find_main_tex_file(tex_files: list[Path]) -> Path:
 
 
 def _expand_inputs(tex: str, base_dir: Path, depth: int = 0, seen: set[Path] | None = None) -> str:
-    """Inline ``\\input{...}`` and ``\\include{...}`` directives.
+    """Inline ``\\input{...}``, ``\\include{...}`` and ``\\bibliography{...}`` directives.
 
-    Looks for each referenced file relative to ``base_dir``, trying both
-    the literal path and the path with a ``.tex`` extension appended.
-    Cycles are broken by tracking already-included files. Unresolved
-    directives are left as-is so the LLM can see something is missing.
+    For ``\\input`` / ``\\include``: looks for each referenced file relative to
+    ``base_dir``, trying both the literal path and the path with a ``.tex``
+    extension appended. Cycles are broken by tracking already-included files.
+    Unresolved directives are left as-is.
+
+    For ``\\bibliography{name}``: arXiv submissions usually ship a pre-built
+    ``<name>.bbl`` (BibTeX output containing ``\\thebibliography`` /
+    ``\\bibitem``). We inline that .bbl in place of the directive, preceded by
+    ``\\section*{References}`` so pandoc emits a proper References heading.
+    Falls back to any ``*.bbl`` in the source tree when the named one is
+    missing (most arXiv tarballs contain exactly one .bbl).
+
+    ``\\bibliographystyle{...}`` is stripped — pandoc doesn't need it.
 
     Args:
         tex: The TeX content to scan.
@@ -365,7 +380,7 @@ def _expand_inputs(tex: str, base_dir: Path, depth: int = 0, seen: set[Path] | N
                 return candidate.resolve()
         return None
 
-    def _replace(match: re.Match[str]) -> str:
+    def _replace_input(match: re.Match[str]) -> str:
         path = _resolve(match.group(1))
         if path is None:
             return match.group(0)
@@ -375,7 +390,192 @@ def _expand_inputs(tex: str, base_dir: Path, depth: int = 0, seen: set[Path] | N
         inner = path.read_text(encoding="utf-8", errors="replace")
         return _expand_inputs(inner, path.parent, depth + 1, seen)
 
-    return _INPUT_DIRECTIVE.sub(_replace, tex)
+    tex = _INPUT_DIRECTIVE.sub(_replace_input, tex)
+
+    # \bibliographystyle isn't needed by pandoc; drop it everywhere.
+    tex = _BIBLIOGRAPHYSTYLE_DIRECTIVE.sub("", tex)
+
+    def _replace_bibliography(match: re.Match[str]) -> str:
+        names = [n.strip() for n in match.group(1).split(",") if n.strip()]
+        bbl_path: Path | None = None
+        for name in names:
+            candidates = list(base_dir.rglob(f"{name}.bbl"))
+            if candidates:
+                bbl_path = candidates[0]
+                break
+        if bbl_path is None:
+            # Common case: only one .bbl in the tarball; use it regardless of name.
+            any_bbl = list(base_dir.rglob("*.bbl"))
+            if any_bbl:
+                bbl_path = any_bbl[0]
+        if bbl_path is None:
+            logger.warning(
+                "No .bbl found for \\bibliography{%s}; references will be missing",
+                match.group(1),
+            )
+            return match.group(0)
+        if bbl_path in seen:
+            return ""
+        seen.add(bbl_path)
+        bbl_content = bbl_path.read_text(encoding="utf-8", errors="replace")
+        expanded_bbl = _expand_inputs(bbl_content, bbl_path.parent, depth + 1, seen)
+        return "\\section*{References}\n" + expanded_bbl
+
+    tex = _BIBLIOGRAPHY_DIRECTIVE.sub(_replace_bibliography, tex)
+    return tex
+
+
+def _match_balanced_brace(text: str, open_pos: int) -> int:
+    """Given the index of an opening ``{`` in *text*, return the index of the matching ``}``.
+
+    Honours TeX-style escaping: ``\\{`` and ``\\}`` are treated as literal
+    characters, not brace delimiters. Raises ``ValueError`` if no balanced
+    closing brace exists.
+    """
+    if open_pos >= len(text) or text[open_pos] != "{":
+        raise ValueError(f"No '{{' at position {open_pos}")
+    depth = 1
+    i = open_pos + 1
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            i += 2  # skip escaped character (\{, \}, \\, etc.)
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise ValueError("Unbalanced braces")
+
+
+def _find_command_inner(tex: str, command: str) -> str | None:
+    """Return the contents of the first ``\\command{...}`` in *tex*, or ``None``."""
+    pattern = re.compile(r"\\" + re.escape(command) + r"\s*\{")
+    m = pattern.search(tex)
+    if not m:
+        return None
+    try:
+        close = _match_balanced_brace(tex, m.end() - 1)
+    except ValueError:
+        return None
+    return tex[m.end() : close]
+
+
+def _strip_command(tex: str, command: str) -> str:
+    """Remove every ``\\command{...}`` occurrence from *tex* (balanced braces)."""
+    pattern = re.compile(r"\\" + re.escape(command) + r"\s*\{")
+    out: list[str] = []
+    last = 0
+    for m in pattern.finditer(tex):
+        try:
+            close = _match_balanced_brace(tex, m.end() - 1)
+        except ValueError:
+            continue
+        out.append(tex[last : m.start()])
+        last = close + 1
+    out.append(tex[last:])
+    return "".join(out)
+
+
+def _find_environment_body(tex: str, env: str) -> str | None:
+    """Return the body of the first ``\\begin{env}...\\end{env}`` block, or ``None``."""
+    begin = re.search(r"\\begin\{" + re.escape(env) + r"\}", tex)
+    if not begin:
+        return None
+    end = re.search(r"\\end\{" + re.escape(env) + r"\}", tex[begin.end() :])
+    if not end:
+        return None
+    return tex[begin.end() : begin.end() + end.start()]
+
+
+def _strip_environment(tex: str, env: str) -> str:
+    """Remove every ``\\begin{env}...\\end{env}`` block from *tex* (non-nested)."""
+    pattern = re.compile(
+        r"\\begin\{" + re.escape(env) + r"\}.*?\\end\{" + re.escape(env) + r"\}",
+        re.DOTALL,
+    )
+    return pattern.sub("", tex)
+
+
+def _clean_author_list(authors: str) -> str:
+    """Normalise a TeX ``\\author{}`` payload into a comma-separated string.
+
+    - Strips ``\\thanks{...}`` blocks (affiliations / emails attached per author).
+    - Replaces ``\\and`` and ``\\\\`` separators with commas.
+    - Collapses whitespace and dedupes adjacent commas.
+    """
+    cleaned = _strip_command(authors, "thanks")
+    cleaned = re.sub(r"\\and\b", ",", cleaned)
+    cleaned = re.sub(r"\\\\", ",", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
+    return cleaned.strip(", ").strip()
+
+
+def _extract_metadata_and_rewrite(tex: str) -> str:
+    """Rewrite ``\\title`` / ``\\author`` / ``\\maketitle`` / abstract env as explicit sections.
+
+    Pandoc invoked without ``--standalone`` discards ``\\title`` / ``\\author``
+    / ``\\begin{abstract}`` metadata when writing Markdown. To preserve them
+    we substitute the title-block machinery with plain ``\\section*`` blocks
+    that pandoc will emit as Markdown headings.
+
+    Behaviour:
+      - ``\\title{...}`` → ``\\section*{title-content}`` (replacing ``\\maketitle``,
+        or inserted right after ``\\begin{document}`` if no ``\\maketitle`` is present).
+      - ``\\author{...}`` → ``\\textit{authors}`` where ``\\and`` / ``\\\\``
+        become commas and ``\\thanks{...}`` is stripped.
+      - ``\\begin{abstract}...\\end{abstract}`` → ``\\section*{Abstract}`` followed
+        by the original body.
+
+    Missing pieces are skipped silently (no-op if neither title nor abstract
+    is found). Math and inline commands inside title / abstract stay in TeX
+    form so pandoc renders them on the subsequent conversion pass.
+    """
+    title_inner = _find_command_inner(tex, "title")
+    author_inner = _find_command_inner(tex, "author")
+    abstract_body = _find_environment_body(tex, "abstract")
+
+    if title_inner is None and abstract_body is None:
+        return tex
+
+    block_parts: list[str] = []
+    if title_inner is not None:
+        block_parts.append("\\section*{" + title_inner.strip() + "}")
+    if author_inner is not None:
+        authors = _clean_author_list(author_inner)
+        if authors:
+            block_parts.append("\\textit{" + authors + "}")
+    if abstract_body is not None:
+        block_parts.append("\\section*{Abstract}\n" + abstract_body.strip())
+
+    title_block = "\n\n".join(block_parts) + "\n"
+
+    # Remove the originals so they don't render twice.
+    result = _strip_command(tex, "title")
+    result = _strip_command(result, "author")
+    result = _strip_environment(result, "abstract")
+
+    if "\\maketitle" in result:
+        result = result.replace("\\maketitle", title_block, 1)
+    else:
+        doc_begin = re.search(r"\\begin\{document\}", result)
+        if doc_begin:
+            insert_at = doc_begin.end()
+            result = result[:insert_at] + "\n\n" + title_block + result[insert_at:]
+        else:
+            result = title_block + result
+
+    logger.info(
+        "Rewrote title/author/abstract as explicit sections (title=%s, authors=%s, abstract=%s)",
+        title_inner is not None,
+        author_inner is not None,
+        abstract_body is not None,
+    )
+    return result
 
 
 def extract_source(tar_path: Path, output_dir: Path) -> tuple[str, list[Path]]:
@@ -417,6 +617,7 @@ def extract_source(tar_path: Path, output_dir: Path) -> tuple[str, list[Path]]:
     main_tex = _find_main_tex_file(tex_files)
     raw_content = main_tex.read_text(encoding="utf-8", errors="replace")
     expanded = _expand_inputs(raw_content, main_tex.parent)
+    expanded = _extract_metadata_and_rewrite(expanded)
 
     # Some submissions are TeX wrappers that just embed a PDF. There is no
     # actual text to translate, so surface this as a PDF-only paper.
