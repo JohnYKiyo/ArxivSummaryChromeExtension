@@ -139,8 +139,7 @@ class JobManager:
         self._table.update_item(
             Key={"job_id": job_id},
             UpdateExpression=(
-                "SET #s = :status, current_step = :step, progress = :prog, "
-                "message = :msg, updated_at = :now"
+                "SET #s = :status, current_step = :step, progress = :prog, message = :msg, updated_at = :now"
             ),
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
@@ -201,10 +200,7 @@ class JobManager:
         # NOTE: `error` is a DynamoDB reserved word — must alias via ExpressionAttributeNames.
         self._table.update_item(
             Key={"job_id": job_id},
-            UpdateExpression=(
-                "SET #s = :status, progress = :prog, "
-                "#e = :err, message = :msg, updated_at = :now"
-            ),
+            UpdateExpression=("SET #s = :status, progress = :prog, #e = :err, message = :msg, updated_at = :now"),
             ExpressionAttributeNames={"#s": "status", "#e": "error"},
             ExpressionAttributeValues={
                 ":status": JobStatus.ERROR.value,

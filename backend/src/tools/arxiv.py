@@ -154,9 +154,7 @@ def _safe_image_basename(url: str, used: set[str]) -> str:
     return safe
 
 
-def _download_html_images(
-    html: str, base_url: str, target_dir: Path
-) -> tuple[str, list[Path]]:
+def _download_html_images(html: str, base_url: str, target_dir: Path) -> tuple[str, list[Path]]:
     """Fetch every ``<img>`` referenced by *html* and rewrite ``src`` to a local path.
 
     For each ``<img src="...">`` whose URL we can resolve, we GET the image

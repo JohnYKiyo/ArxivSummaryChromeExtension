@@ -98,16 +98,12 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise PandocConversionError(
-            f"pandoc timed out after {_PANDOC_TIMEOUT_SECONDS}s"
-        ) from exc
+        raise PandocConversionError(f"pandoc timed out after {_PANDOC_TIMEOUT_SECONDS}s") from exc
 
     if result.returncode != 0:
         # Pandoc puts useful errors on stderr; include them so the user
         # has something actionable in the logs.
-        raise PandocConversionError(
-            f"pandoc exited with code {result.returncode}: {result.stderr.strip()}"
-        )
+        raise PandocConversionError(f"pandoc exited with code {result.returncode}: {result.stderr.strip()}")
 
     markdown = result.stdout
     if result.stderr:
