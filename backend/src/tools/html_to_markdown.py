@@ -150,11 +150,16 @@ def _restore_math(markdown: str, sources: list[str]) -> str:
 
 
 def _absolutize_urls(soup: Tag, base_url: str) -> None:
-    """Resolve relative ``src``/``href`` against ``base_url``."""
-    for el in soup.find_all(["img", "a"]):
+    """Resolve relative ``href`` on ``<a>`` elements against ``base_url``.
+
+    Note: ``<img src>`` is intentionally *not* touched. The fetcher
+    (``tools/arxiv._download_html_images``) has already downloaded images
+    locally and rewritten ``src`` to ``images/<file>``; absolutising here
+    would point those relative paths back at arxiv.org and break the ZIP.
+    """
+    for el in soup.find_all("a"):
         if not isinstance(el, Tag):
             continue
-        for attr in ("src", "href"):
-            value = el.get(attr)
-            if isinstance(value, str) and value and not value.startswith(("http://", "https://", "data:", "#")):
-                el[attr] = urljoin(base_url, value)
+        value = el.get("href")
+        if isinstance(value, str) and value and not value.startswith(("http://", "https://", "data:", "#")):
+            el["href"] = urljoin(base_url, value)

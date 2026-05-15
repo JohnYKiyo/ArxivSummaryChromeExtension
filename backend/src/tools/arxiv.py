@@ -21,8 +21,10 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urljoin, urlparse
 
 import requests
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,13 @@ _MAX_INPUT_DEPTH = 10
 # so arXiv accepts it; for our purposes it is equivalent to a PDF-only
 # paper since there is no textual content to translate.
 _PDF_WRAPPER_DIRECTIVE = re.compile(r"\\includepdf\b")
+
+# Filename sanitisation for HTML image downloads. Keep alphanumerics plus
+# the conventional path characters; everything else becomes underscore.
+_BASENAME_SAFE_CHARS = re.compile(r"[^a-zA-Z0-9._-]")
+
+# Per-image download timeout. arXiv-hosted figures are small (KB to a few MB).
+_IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -121,14 +130,102 @@ def extract_arxiv_id(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def try_fetch_html(arxiv_id: str) -> str | None:
+def _safe_image_basename(url: str, used: set[str]) -> str:
+    """Derive a unique, filesystem-safe filename from an image URL.
+
+    Strategy:
+    - Use the URL's path component basename when available, else ``image``.
+    - Replace any character outside ``[A-Za-z0-9._-]`` with underscore.
+    - If the basename collides with one already taken, append ``_1``, ``_2``,
+      ... before the extension.
+    """
+    name = Path(urlparse(url).path).name or "image"
+    safe = _BASENAME_SAFE_CHARS.sub("_", name) or "image"
+
+    if safe not in used:
+        return safe
+
+    stem, dot, ext = safe.partition(".")
+    for n in range(1, 10_000):
+        candidate = f"{stem}_{n}{dot}{ext}"
+        if candidate not in used:
+            return candidate
+    # Practical impossibility — bail out by overwriting.
+    return safe
+
+
+def _download_html_images(
+    html: str, base_url: str, target_dir: Path
+) -> tuple[str, list[Path]]:
+    """Fetch every ``<img>`` referenced by *html* and rewrite ``src`` to a local path.
+
+    For each ``<img src="...">`` whose URL we can resolve, we GET the image
+    and write it to ``target_dir / <safe-basename>``. The ``src`` attribute
+    in the HTML is rewritten to ``images/<safe-basename>`` so the ZIP that
+    we ultimately ship has self-contained references (``packaging.create_zip_package``
+    places listed images at ``images/<file>`` already).
+
+    If a download fails (network error, 404, etc.), the ``<img>`` keeps its
+    *absolute* URL — readers with internet will still see something rather
+    than a broken link.
+
+    ``data:`` URIs and empty ``src`` are left alone.
+
+    Args:
+        html: Raw HTML of the paper page.
+        base_url: Base URL for resolving relative ``src`` attributes.
+        target_dir: Directory to write downloaded images into. Created if
+            absent.
+
+    Returns:
+        ``(rewritten_html, downloaded_paths)``. Only successfully downloaded
+        images appear in *downloaded_paths*.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    downloaded: list[Path] = []
+    used_basenames: set[str] = set()
+
+    for img in soup.find_all("img"):
+        src = img.get("src")
+        if not isinstance(src, str) or not src or src.startswith("data:"):
+            continue
+
+        abs_url = urljoin(base_url, src)
+        basename = _safe_image_basename(abs_url, used_basenames)
+        local_path = target_dir / basename
+
+        try:
+            response = requests.get(abs_url, timeout=_IMAGE_DOWNLOAD_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            local_path.write_bytes(response.content)
+        except (requests.RequestException, OSError) as exc:
+            logger.warning("Failed to download image %s: %s — keeping absolute URL", abs_url, exc)
+            img["src"] = abs_url  # leave readers with a working external link
+            continue
+
+        used_basenames.add(basename)
+        downloaded.append(local_path)
+        img["src"] = f"images/{basename}"
+
+    logger.info("Downloaded %d HTML images to %s", len(downloaded), target_dir)
+    return str(soup), downloaded
+
+
+def try_fetch_html(arxiv_id: str) -> tuple[str, str] | None:
     """Attempt to fetch the HTML version of a paper.
 
     Args:
         arxiv_id: A valid arXiv paper ID.
 
     Returns:
-        The HTML body as a string if available, otherwise ``None``.
+        A tuple ``(html_body, final_url)`` if HTML is available, otherwise
+        ``None``. The *final_url* is the page URL after redirects (arXiv
+        typically redirects ``/html/<id>`` to ``/html/<id>v<n>``), which
+        is what we need as the base URL for resolving relative ``<img>``
+        sources.
+
         ``None`` is returned for 404 or non-HTML responses; other HTTP
         failures propagate as :class:`requests.HTTPError`.
     """
@@ -149,8 +246,8 @@ def try_fetch_html(arxiv_id: str) -> str | None:
         logger.info("Unexpected Content-Type for HTML endpoint: %s", content_type)
         return None
 
-    logger.info("Fetched HTML version of %s (%d bytes)", arxiv_id, len(response.content))
-    return response.text
+    logger.info("Fetched HTML version of %s (%d bytes) from %s", arxiv_id, len(response.content), response.url)
+    return response.text, response.url
 
 
 # ---------------------------------------------------------------------------
@@ -370,14 +467,21 @@ def fetch_arxiv_paper(url: str) -> PaperSource:
     logger.info("Working directory: %s", work_dir)
 
     # 1. Try the HTML version first.
-    html = try_fetch_html(arxiv_id)
-    if html is not None:
+    html_result = try_fetch_html(arxiv_id)
+    if html_result is not None:
+        html, final_url = html_result
+        # final_url is the post-redirect page URL (e.g. .../1706.03762v7);
+        # urljoin treats its last path component as a "filename" and uses
+        # the parent for relative resolution, which is exactly the browser
+        # rule we need for ``<img src="1706.03762v7/Figures/X.png">``.
+        images_dir = work_dir / "html_images"
+        rewritten_html, image_paths = _download_html_images(html, final_url, images_dir)
         return PaperSource(
             kind="html",
-            content=html,
+            content=rewritten_html,
             work_dir=work_dir,
             arxiv_id=arxiv_id,
-            images=[],
+            images=image_paths,
         )
 
     # 2. Fall back to the TeX e-print source.
