@@ -1,1 +1,1 @@
-"""Service layer for job management and server-sent events."""
+"""Service layer for job management."""

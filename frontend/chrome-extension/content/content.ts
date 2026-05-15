@@ -97,7 +97,8 @@ async function handleTranslateClick(): Promise<void> {
       chrome.runtime.onMessage.addListener(
         (msg: { type: string; progress?: number; status?: string }) => {
           if (msg.type === "CONVERSION_PROGRESS" && button) {
-            const pct = Math.round((msg.progress ?? 0) * 100);
+            // progress is already an integer 0–100 from the polling API.
+            const pct = msg.progress ?? 0;
             button.textContent = `${pct}%`;
           }
           if (msg.type === "CONVERSION_COMPLETE" && button) {

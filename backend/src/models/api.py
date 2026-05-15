@@ -26,7 +26,19 @@ class ConvertResponse(BaseModel):
 
     job_id: str
     status: str
-    stream_url: str
+    status_url: str
+
+
+class StatusResponse(BaseModel):
+    """Response body for the ``GET /jobs/{job_id}/status`` endpoint."""
+
+    job_id: str
+    status: str
+    current_step: str | None = None
+    progress: int = 0
+    message: str | None = None
+    error: str | None = None
+    download_url: str | None = None
 
 
 class HealthResponse(BaseModel):

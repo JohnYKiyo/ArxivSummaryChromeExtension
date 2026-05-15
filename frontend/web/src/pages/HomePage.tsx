@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { UrlInput, submitUrl } from "../features/paper-convert";
-import { DownloadButton, ProgressView, useSSE } from "../features/job-status";
+import { DownloadButton, ProgressView, useJobPolling } from "../features/job-status";
 
 type AppState = "idle" | "processing" | "completed";
 
@@ -17,14 +17,14 @@ export default function HomePage() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  const sse = useSSE(jobId);
+  const job = useJobPolling(jobId);
 
-  // Transition to completed when SSE reports completion
+  // Transition to completed when polling reports completion
   useEffect(() => {
-    if (sse.isComplete && appState === "processing") {
+    if (job.isComplete && appState === "processing") {
       setAppState("completed");
     }
-  }, [sse.isComplete, appState]);
+  }, [job.isComplete, appState]);
 
   const handleSubmit = useCallback(async (url: string) => {
     setSubmitError(null);
@@ -64,20 +64,20 @@ export default function HomePage() {
       {/* Progress view */}
       {appState === "processing" && (
         <ProgressView
-          currentStep={sse.currentStep}
-          progress={sse.progress}
-          isError={sse.isError}
-          errorMessage={sse.errorMessage}
+          currentStep={job.currentStep}
+          progress={job.progress}
+          isError={job.isError}
+          errorMessage={job.errorMessage}
         />
       )}
 
       {/* Download button */}
-      {appState === "completed" && sse.downloadUrl && (
-        <DownloadButton downloadUrl={sse.downloadUrl} />
+      {appState === "completed" && job.downloadUrl && (
+        <DownloadButton downloadUrl={job.downloadUrl} />
       )}
 
       {/* Reset button */}
-      {(appState === "completed" || sse.isError) && (
+      {(appState === "completed" || job.isError) && (
         <div className="text-center">
           <button
             onClick={handleReset}

@@ -11,7 +11,17 @@ export interface ProgressEvent {
   message: string;
 }
 
-export interface SSEState {
+export interface StatusResponse {
+  job_id: string;
+  status: string;
+  current_step: StepName | null;
+  progress: number;
+  message: string | null;
+  error: string | null;
+  download_url: string | null;
+}
+
+export interface JobState {
   events: ProgressEvent[];
   currentStep: StepName | null;
   progress: number;

@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """CDK app entry point for the arXiv Translator infrastructure.
 
-Instantiates and wires together the four stacks:
-  NetworkStack  -> VPC
+Instantiates and wires together the three stacks:
   AuthStack     -> Cognito
   StorageStack  -> S3 + CloudFront
-  BackendStack  -> ECR + ECS Fargate + ALB
+  BackendStack  -> Lambda + API Gateway + DynamoDB
 """
 
 import os
 
 import aws_cdk as cdk
 
-from stacks import AuthStack, BackendStack, NetworkStack, StorageStack
+from stacks import AuthStack, BackendStack, StorageStack
 
 app = cdk.App()
 
@@ -34,12 +33,6 @@ common_tags = {
 # Stacks
 # ---------------------------------------------------------------------------
 
-network_stack = NetworkStack(
-    app,
-    "ArxivTranslatorNetwork",
-    env=env,
-)
-
 auth_stack = AuthStack(
     app,
     "ArxivTranslatorAuth",
@@ -56,7 +49,6 @@ backend_stack = BackendStack(
     app,
     "ArxivTranslatorBackend",
     env=env,
-    vpc=network_stack.vpc,
     user_pool_id=auth_stack.user_pool.user_pool_id,
     user_pool_client_id=auth_stack.user_pool_client.user_pool_client_id,
     zip_bucket=storage_stack.zip_bucket,
@@ -64,7 +56,6 @@ backend_stack = BackendStack(
 )
 
 # Explicit dependencies
-backend_stack.add_dependency(network_stack)
 backend_stack.add_dependency(auth_stack)
 backend_stack.add_dependency(storage_stack)
 

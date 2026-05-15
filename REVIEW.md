@@ -25,12 +25,14 @@ PR レビュー時に自動的に読み込まれ、以下の観点でコード�
 
 ```
 backend/src/
-├── api/          # Interface Adapters - ルーティング、リクエスト/レスポンス変換
-├── services/     # Use Cases - アプリケーション固有のビジネスルール
-├── agents/       # Use Cases - AI エージェントのオーケストレーション
-├── tools/        # Interface Adapters - 外部サービスとの通信
-├── models/       # Entities - ドメインモデル、ビジネスルール (フレームワーク非依存)
-└── config.py     # Frameworks & Drivers - 設定
+├── api/                  # Interface Adapters - ルーティング、リクエスト/レスポンス変換
+├── services/             # Use Cases - アプリケーション固有のビジネスルール
+├── agents/               # Use Cases - AI エージェントのオーケストレーション
+├── tools/                # Interface Adapters - 外部サービスとの通信
+├── models/               # Entities - ドメインモデル、ビジネスルール (フレームワーク非依存)
+├── config.py             # Frameworks & Drivers - 設定
+├── main.py               # FastAPI app + Mangum Lambda handler (API)
+└── pipeline_handler.py   # Lambda handler (パイプライン実行)
 ```
 
 - `api/` レイヤーが `services/` や `agents/` を直接インポートすることは許可するが、逆方向の依存はフラグを立てる

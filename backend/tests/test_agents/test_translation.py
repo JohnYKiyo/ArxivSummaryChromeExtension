@@ -88,3 +88,38 @@ class TestTranslationInstruction:
         """Output should be plain Markdown, no code fences."""
         instruction = self._get_instruction()
         assert "code fence" in instruction.lower()
+
+    def test_instruction_demands_completeness(self) -> None:
+        """The prompt must explicitly forbid omission / truncation.
+
+        Without an explicit "translate everything" rule, Gemini tends to
+        skip what it considers boilerplate (title, author list, license
+        notice) when the input is large.
+        """
+        instruction = self._get_instruction()
+        lowered = instruction.lower()
+        # Some form of "translate the entire document".
+        assert "entire" in lowered or "every" in lowered
+        # Explicit ban on common skip phrases.
+        assert "省略" in instruction
+
+
+# ---------------------------------------------------------------------------
+# Output-token budget
+# ---------------------------------------------------------------------------
+
+
+class TestGenerationConfig:
+    """Verify the agent allocates a large output budget for long papers."""
+
+    def test_max_output_tokens_is_set(self) -> None:
+        """``max_output_tokens`` must be explicit and large.
+
+        Gemini 2.5 Pro defaults to ~8K output tokens which silently
+        truncates long papers (e.g. 50KB Japanese ≈ 25K tokens).
+        """
+        agent = create_translation_agent("gemini-2.5-pro")
+        cfg = agent.generate_content_config
+        assert cfg is not None
+        assert cfg.max_output_tokens is not None
+        assert cfg.max_output_tokens >= 32768

@@ -51,10 +51,8 @@ node_modules/
 # Vite
 frontend/web/dist/
 
-# Chrome Extension compiled output
-frontend/chrome-extension/popup/popup.js
-frontend/chrome-extension/content/content.js
-frontend/chrome-extension/background/service-worker.js
+# Chrome Extension compiled output (esbuild → dist/)
+frontend/chrome-extension/dist/
 
 # ============================================================
 # Environment / Secrets
@@ -62,6 +60,11 @@ frontend/chrome-extension/background/service-worker.js
 .env
 .env.*
 !.env.example
+
+# ============================================================
+# Claude Code (internal state — scheduled tasks, worktrees, etc.)
+# ============================================================
+.claude/
 
 # ============================================================
 # IDE / Editor

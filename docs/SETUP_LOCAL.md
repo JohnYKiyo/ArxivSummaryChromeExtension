@@ -44,16 +44,22 @@ LLM_MODEL=gemini-2.5-pro-preview-05-06
 APP_ENV=development
 LOG_LEVEL=DEBUG
 CORS_ORIGINS=http://localhost:5173
+
+# DynamoDB Local (Docker Compose で自動設定されるため通常は不要)
+# DYNAMODB_TABLE_NAME=arxiv-translator-jobs
+# DYNAMODB_ENDPOINT_URL=http://localhost:8100
 ```
 
-> **Note**: ローカル開発では `COGNITO_*` や `S3_*` の設定は不要です。
-> `APP_ENV=development` の場合、Cognito 認証はスキップされます。
+> **Note**: ローカル開発では `COGNITO_*` と `S3_*` の設定は不要です。
+> - `APP_ENV=development` の場合、Cognito 認証はスキップされます
+> - `S3_BUCKET_NAME` が空の場合、ZIP ファイルはローカルに保存され `GET /api/v1/jobs/{job_id}/download` で取得できます（S3 アカウント不要）
+> - DynamoDB Local は Docker Compose で自動的に起動・テーブル作成されます
 
 ---
 
 ## 方法 1: Docker Compose で起動 (推奨)
 
-最も簡単な方法です。コマンド1つで backend + frontend が起動します。
+最も簡単な方法です。コマンド1つで DynamoDB Local + backend + frontend が起動します。
 
 ### 起動
 
@@ -69,6 +75,7 @@ docker compose up --build
 | Backend (API) | http://localhost:8000 |
 | API ドキュメント (Swagger) | http://localhost:8000/docs |
 | ヘルスチェック | http://localhost:8000/api/v1/health |
+| DynamoDB Local | http://localhost:8100 |
 
 ### ホットリロード
 
@@ -185,10 +192,8 @@ pytest tests/ --cov=src --cov-report=html
 ```bash
 cd backend
 
-# Tex → Markdown 変換の評価
-python -m tests.eval.eval_tex2markdown
-
 # 翻訳の評価
+# (TeX → Markdown 変換は pandoc 経由で決定的に行うため eval は不要)
 python -m tests.eval.eval_translation
 
 # 要約の評価
@@ -214,12 +219,23 @@ npm run build
 
 ## Chrome 拡張機能の開発
 
-### ビルドなしでテスト (開発モード)
+### ビルド
+
+```bash
+cd frontend/chrome-extension
+npm install
+npm run build       # 一回ビルド → dist/ に出力
+npm run watch       # ウォッチモード（変更時に自動ビルド）
+```
+
+### Chrome への読み込み
 
 1. Chrome で `chrome://extensions/` を開く
 2. 右上の「デベロッパーモード」を有効にする
 3. 「パッケージ化されていない拡張機能を読み込む」をクリック
-4. `frontend/chrome-extension/` フォルダを選択
+4. `frontend/chrome-extension/dist/` フォルダを選択
+
+> **Note**: `dist/` を読み込むので、ソースを変更した後は `npm run build`（またはウォッチ中なら自動ビルド）が必要です。
 
 ### 設定
 

@@ -2,12 +2,12 @@
 
 Initializes the FastAPI app, configures CORS middleware,
 and registers API route handlers for the arXiv Translator service.
+Supports both uvicorn (local dev) and Mangum (AWS Lambda) execution.
 """
 
-import asyncio
 import logging
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
@@ -16,49 +16,36 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.routes import init_routes, router
 from src.config import get_settings
 from src.services.job_manager import JobManager
-from src.services.sse import EventBus
+from src.services.pipeline_dispatcher import build_dispatcher
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Shared service instances
-# ---------------------------------------------------------------------------
-
-job_manager = JobManager()
-event_bus = EventBus()
 
 # ---------------------------------------------------------------------------
 # Lifespan (startup / shutdown)
 # ---------------------------------------------------------------------------
 
-_cleanup_task: asyncio.Task[None] | None = None
-
-
-async def _periodic_cleanup() -> None:
-    """Background task that removes expired jobs on a regular interval."""
-    settings = get_settings()
-    while True:
-        try:
-            await asyncio.sleep(300)  # Run every 5 minutes
-            removed = await job_manager.cleanup_expired(settings.JOB_TTL_SECONDS)
-            if removed:
-                logger.info("Periodic cleanup removed %d expired jobs", removed)
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            logger.exception("Error during periodic cleanup")
-
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     """Application lifespan handler for startup and shutdown logic."""
-    global _cleanup_task  # noqa: PLW0603
-
-    # Startup
     settings = get_settings()
     _configure_logging(settings.LOG_LEVEL)
-    init_routes(job_manager, event_bus)
-    _cleanup_task = asyncio.create_task(_periodic_cleanup())
+
+    # Initialize DynamoDB-backed JobManager and the pipeline dispatcher.
+    # The dispatcher selects between Lambda invoke (prod) and an in-process
+    # asyncio task (local dev) based on PIPELINE_LAMBDA_NAME.
+    job_manager = JobManager(
+        table_name=settings.DYNAMODB_TABLE_NAME,
+        endpoint_url=settings.DYNAMODB_ENDPOINT_URL,
+        ttl_seconds=settings.JOB_TTL_SECONDS,
+    )
+    dispatcher = build_dispatcher(
+        job_manager=job_manager,
+        pipeline_lambda_name=settings.PIPELINE_LAMBDA_NAME,
+    )
+    init_routes(job_manager, dispatcher)
+
     logger.info(
         "arXiv Translator started (env=%s, log_level=%s)",
         settings.APP_ENV,
@@ -66,11 +53,6 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     )
     yield
 
-    # Shutdown
-    if _cleanup_task is not None:
-        _cleanup_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _cleanup_task
     logger.info("arXiv Translator shut down")
 
 
@@ -128,10 +110,19 @@ def _configure_logging(level: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# Entrypoints
 # ---------------------------------------------------------------------------
 
 app = create_app()
+
+# AWS Lambda handler via Mangum (used when deployed to Lambda)
+try:
+    from mangum import Mangum
+
+    handler = Mangum(app, lifespan="off")
+except ImportError:
+    # Mangum not installed — running locally with uvicorn
+    handler = None  # type: ignore[assignment]
 
 if __name__ == "__main__":
     settings = get_settings()

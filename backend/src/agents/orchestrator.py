@@ -1,10 +1,18 @@
-"""OrchestratorAgent - Sequential pipeline controller.
+"""Pipeline orchestrator for the arXiv translation workflow.
 
-Coordinates the execution of all agents in the translation pipeline:
-TexFetchAgent -> Tex2MarkdownAgent -> TranslationAgent -> SummaryAgent.
-Reports progress via SSE events at each stage transition.
-Implemented as a Google ADK SequentialAgent with sub-agents, plus a
-``run_pipeline`` helper for programmatic invocation with SSE support.
+Coordinates the execution of all stages:
+
+    fetch_arxiv_paper -> source-to-markdown (deterministic) ->
+        TranslationAgent -> SummaryAgent
+
+The source-to-markdown step branches on the format returned by
+``fetch_arxiv_paper``: HTML papers are converted via ``markdownify``,
+TeX papers via ``pandoc``. Both paths are pure-library transforms with
+no LLM call, so only the translation and summary stages remain on the
+LLM. Each LLM agent is run independently with its own InMemoryRunner so
+that DynamoDB progress writes can be interleaved between stages and
+non-LLM steps (arXiv fetch, ZIP packaging, S3 upload) can be mixed into
+the same flow.
 """
 
 from __future__ import annotations
@@ -14,28 +22,25 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 from google.adk.agents import LlmAgent
-from google.adk.agents.sequential_agent import SequentialAgent
 from google.adk.runners import InMemoryRunner
 from google.genai import types as genai_types
 
 from src.agents.summary import create_summary_agent
-from src.agents.tex2markdown import create_tex2markdown_agent
-from src.agents.tex_fetch import create_tex_fetch_agent
 from src.agents.translation import create_translation_agent
 from src.config import get_settings
 from src.models.job import JobStatus
-from src.models.sse_event import SSEEvent
-from src.tools.arxiv import fetch_arxiv_paper
-from src.tools.packaging import create_zip_package
+from src.tools.arxiv import PdfOnlyPaperError, fetch_arxiv_paper
+from src.tools.html_to_markdown import html_to_markdown
+from src.tools.packaging import create_zip_package, upload_to_s3
+from src.tools.tex_to_markdown import tex_to_markdown
 
 if TYPE_CHECKING:
     from src.services.job_manager import JobManager
-    from src.services.sse import EventBus
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Pipeline stages used for SSE progress reporting
+# Pipeline stages used for progress reporting
 # ---------------------------------------------------------------------------
 
 STAGES = [
@@ -47,50 +52,50 @@ STAGES = [
 ]
 
 
-def create_orchestrator_agent(model: str) -> SequentialAgent:
-    """Create the top-level orchestrator as a :class:`SequentialAgent`.
-
-    The orchestrator runs four sub-agents in sequence.  Each sub-agent
-    stores its output in the shared session state via ``output_key``,
-    so downstream agents can reference upstream results using
-    ``{output_key}`` placeholders in their instructions.
-
-    Args:
-        model: The LLM model identifier.
-
-    Returns:
-        A configured :class:`SequentialAgent`.
-    """
-    tex_fetch = create_tex_fetch_agent(model)
-    tex2md = create_tex2markdown_agent(model)
-    translation = create_translation_agent(model)
-    summary = create_summary_agent(model)
-
-    return SequentialAgent(
-        name="OrchestratorAgent",
-        description=(
-            "Orchestrates the full arXiv paper translation pipeline: "
-            "fetch TeX, convert to Markdown, translate to Japanese, "
-            "and generate a summary."
-        ),
-        sub_agents=[tex_fetch, tex2md, translation, summary],
-    )
-
-
 # ---------------------------------------------------------------------------
-# Programmatic pipeline execution with SSE progress
+# Pipeline execution with DynamoDB progress
 # ---------------------------------------------------------------------------
 
 
 async def _extract_final_text_async(event_stream: Any) -> str:
-    """Walk an async event stream and return the last text content produced."""
-    final_text = ""
+    """Walk an ADK event stream and concatenate all non-thought text parts.
+
+    ADK emits several events per agent turn. Each event has zero or more
+    ``parts``; each part is either a "thought" (Gemini's internal
+    reasoning, marked with ``part.thought = True``) or a real text chunk
+    that belongs in the answer.
+
+    Long outputs are streamed across multiple non-thought parts. The
+    earlier "pick the longest part" heuristic dropped all but one chunk,
+    silently truncating long translations — typical paper outputs are
+    ~30KB Japanese which Gemini emits as several streaming chunks rather
+    than one monolithic text.
+
+    Strategy:
+      - Skip parts marked as thoughts.
+      - Concatenate everything else in arrival order.
+    """
+    chunks: list[str] = []
+    thought_parts = 0
+    text_parts = 0
     async for event in event_stream:
         if event.content and event.content.parts:
             for part in event.content.parts:
-                if hasattr(part, "text") and part.text:
-                    final_text = part.text
-    return final_text
+                if getattr(part, "thought", False):
+                    thought_parts += 1
+                    continue
+                text = getattr(part, "text", None)
+                if text:
+                    text_parts += 1
+                    chunks.append(text)
+    result = "".join(chunks)
+    logger.info(
+        "Agent emitted %d text parts (%d thought parts skipped); total output: %d chars",
+        text_parts,
+        thought_parts,
+        len(result),
+    )
+    return result
 
 
 async def _run_single_agent(
@@ -112,6 +117,14 @@ async def _run_single_agent(
     user_id = "pipeline"
     session_id = str(uuid.uuid4())
 
+    # ADK >=0.3 requires sessions to exist before run_async; the runner
+    # no longer auto-creates them, so create_session() explicitly first.
+    await runner.session_service.create_session(
+        app_name=runner.app_name,
+        user_id=user_id,
+        session_id=session_id,
+    )
+
     content = genai_types.Content(
         role="user",
         parts=[genai_types.Part(text=user_message)],
@@ -127,32 +140,27 @@ async def _run_single_agent(
 
 
 async def _publish_progress(
-    event_bus: EventBus | None,
     job_manager: JobManager | None,
     job_id: str,
     stage_index: int,
 ) -> None:
-    """Publish an SSE progress event and update job status.
+    """Update job progress in DynamoDB.
 
     Args:
-        event_bus: Optional SSE event bus for real-time progress.
-        job_manager: Optional job manager for status updates.
+        job_manager: Optional job manager for progress updates.
         job_id: The job identifier.
         stage_index: Index into :data:`STAGES`.
     """
     stage = STAGES[stage_index]
 
     if job_manager is not None:
-        await job_manager.update_status(job_id, stage["status"])
-
-    if event_bus is not None:
-        event = SSEEvent(
-            event=stage["name"],
-            step=stage["name"],
-            message=stage["label"],
+        await job_manager.update_progress(
+            job_id=job_id,
+            status=stage["status"],
+            current_step=stage["name"],
             progress=stage["progress"],
+            message=stage["label"],
         )
-        await event_bus.publish(job_id, event)
 
     logger.info("Pipeline [%s] stage=%s progress=%d%%", job_id, stage["name"], stage["progress"])
 
@@ -160,27 +168,25 @@ async def _publish_progress(
 async def run_pipeline(
     arxiv_url: str,
     job_id: str,
-    event_bus: EventBus | None = None,
     job_manager: JobManager | None = None,
 ) -> dict[str, Any]:
-    """Execute the full translation pipeline with SSE progress reporting.
+    """Execute the full translation pipeline with DynamoDB progress reporting.
 
-    Runs each agent in sequence, publishing progress events between stages.
-    The TeX fetch stage calls the arXiv tool directly (no LLM needed),
-    while subsequent stages use LLM-based agents.
+    Runs each agent in sequence, updating progress in DynamoDB between stages.
+    The frontend polls the ``GET /api/v1/jobs/{job_id}/status`` endpoint to
+    read the latest progress.
 
     Args:
         arxiv_url: The arXiv paper URL to process.
         job_id: Unique job identifier for progress tracking.
-        event_bus: Optional SSE event bus for real-time progress.
-        job_manager: Optional job manager for status updates.
+        job_manager: Optional job manager for progress updates.
 
     Returns:
         A dict containing:
           - ``markdown_en``: English Markdown content.
           - ``markdown_ja``: Japanese Markdown content.
           - ``summary_ja``: Japanese summary.
-          - ``zip_path``: Path to the output ZIP archive (or ``None``).
+          - ``download_url``: Presigned S3 URL for the output ZIP (or ``None``).
     """
     settings = get_settings()
     model = settings.LLM_MODEL
@@ -189,32 +195,33 @@ async def run_pipeline(
         "markdown_en": None,
         "markdown_ja": None,
         "summary_ja": None,
-        "zip_path": None,
+        "download_url": None,
     }
 
     try:
-        # ---- Stage 0: Fetch TeX ----
-        await _publish_progress(event_bus, job_manager, job_id, 0)
+        # ---- Stage 0: Fetch source (HTML preferred, TeX fallback) ----
+        await _publish_progress(job_manager, job_id, 0)
 
         # Fetch directly — no LLM needed for downloading/extracting files.
-        tex_content, image_paths, work_dir = fetch_arxiv_paper(arxiv_url)
-        image_paths_str = "\n".join(str(p) for p in image_paths)
+        paper = fetch_arxiv_paper(arxiv_url)
+        work_dir = paper.work_dir
 
-        # ---- Stage 1: TeX -> Markdown ----
-        await _publish_progress(event_bus, job_manager, job_id, 1)
-        tex2md_agent = create_tex2markdown_agent(model)
-        markdown_en = await _run_single_agent(
-            tex2md_agent,
-            (
-                f"Convert the following TeX content to Markdown.\n\n"
-                f"Image paths available:\n{image_paths_str}\n\n"
-                f"TeX content:\n{tex_content}"
-            ),
-        )
+        # ---- Stage 1: Source -> Markdown (deterministic, no LLM) ----
+        await _publish_progress(job_manager, job_id, 1)
+        if paper.kind == "html":
+            base_url = f"https://arxiv.org/html/{paper.arxiv_id}/"
+            markdown_en = html_to_markdown(paper.content, base_url=base_url)
+            logger.info("HTML → Markdown via markdownify (%d chars)", len(markdown_en))
+        else:
+            # TeX source — pandoc handles structure, math, citations, figures.
+            # \input / \include were already expanded upstream, so the input
+            # is a single self-contained document.
+            markdown_en = tex_to_markdown(paper.content, work_dir=paper.work_dir)
+            logger.info("TeX → Markdown via pandoc (%d chars)", len(markdown_en))
         results["markdown_en"] = markdown_en
 
         # ---- Stage 2: Translation ----
-        await _publish_progress(event_bus, job_manager, job_id, 2)
+        await _publish_progress(job_manager, job_id, 2)
         translation_agent = create_translation_agent(model)
         markdown_ja = await _run_single_agent(
             translation_agent,
@@ -223,7 +230,7 @@ async def run_pipeline(
         results["markdown_ja"] = markdown_ja
 
         # ---- Stage 3: Summary ----
-        await _publish_progress(event_bus, job_manager, job_id, 3)
+        await _publish_progress(job_manager, job_id, 3)
         summary_agent = create_summary_agent(model)
         summary_ja = await _run_single_agent(
             summary_agent,
@@ -232,49 +239,54 @@ async def run_pipeline(
         results["summary_ja"] = summary_ja
 
         # ---- Stage 4: Packaging ----
-        await _publish_progress(event_bus, job_manager, job_id, 4)
+        await _publish_progress(job_manager, job_id, 4)
         zip_path = create_zip_package(
             paper_en_md=markdown_en,
             paper_ja_md=markdown_ja,
             summary_ja_md=summary_ja,
-            image_paths=image_paths,
+            image_paths=paper.images,
             work_dir=work_dir,
+            arxiv_id=paper.arxiv_id,
         )
-        results["zip_path"] = str(zip_path)
+
+        # Upload to S3 (production) or keep locally (local dev)
+        if settings.S3_BUCKET_NAME:
+            download_url = upload_to_s3(
+                zip_path=zip_path,
+                job_id=job_id,
+                bucket_name=settings.S3_BUCKET_NAME,
+                presigned_url_expiry=settings.S3_PRESIGNED_URL_EXPIRY,
+            )
+        else:
+            # Local development: serve via the download endpoint
+            download_url = f"/api/v1/jobs/{job_id}/download"
+            logger.info("S3_BUCKET_NAME not set — ZIP kept locally at %s", zip_path)
+        results["download_url"] = download_url
 
         # ---- Done ----
         if job_manager is not None:
-            await job_manager.set_result(job_id, zip_path)
-
-        if event_bus is not None:
-            complete_event = SSEEvent(
-                event="complete",
-                step="done",
-                message="処理が完了しました",
-                progress=100,
-                data={"download_url": f"/api/v1/jobs/{job_id}/download"},
-            )
-            await event_bus.publish(job_id, complete_event)
-            await event_bus.remove(job_id)
+            local_path = str(zip_path) if not settings.S3_BUCKET_NAME else None
+            await job_manager.set_result(job_id, download_url, local_result_path=local_path)
 
         logger.info("Pipeline [%s] completed successfully", job_id)
+
+    except PdfOnlyPaperError as exc:
+        # Friendly, actionable message for the common "only-PDF" case.
+        # We surface this through DynamoDB; don't re-raise so the background
+        # task doesn't generate a noisy traceback for an expected condition.
+        logger.warning("Pipeline [%s] aborted: PDF-only paper (%s)", job_id, exc)
+        if job_manager is not None:
+            await job_manager.set_error(
+                job_id,
+                "この論文は PDF 版のみ提供されており、HTML/TeX ソースがないため変換できません。",
+            )
+        return results
 
     except Exception:
         logger.exception("Pipeline [%s] failed", job_id)
 
         if job_manager is not None:
             await job_manager.set_error(job_id, "Pipeline execution failed")
-
-        if event_bus is not None:
-            error_event = SSEEvent(
-                event="error",
-                step="error",
-                message="処理中にエラーが発生しました",
-                progress=0,
-                data={"message": "Pipeline execution failed"},
-            )
-            await event_bus.publish(job_id, error_event)
-            await event_bus.remove(job_id)
 
         raise
 
