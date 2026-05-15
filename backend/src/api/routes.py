@@ -175,10 +175,12 @@ async def download_job_result(
             detail="Result file no longer available",
         )
 
+    # Use the on-disk filename (which the pipeline writes as
+    # ``<arxiv_id>.zip``) so the user's browser downloads under that name.
     return FileResponse(
         path=result_path,
         media_type="application/zip",
-        filename="output.zip",
+        filename=result_path.name,
     )
 
 

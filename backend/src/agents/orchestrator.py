@@ -231,6 +231,7 @@ async def run_pipeline(
             summary_ja_md=summary_ja,
             image_paths=paper.images,
             work_dir=work_dir,
+            arxiv_id=paper.arxiv_id,
         )
 
         # Upload to S3 (production) or keep locally (local dev)

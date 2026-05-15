@@ -25,18 +25,20 @@ def create_zip_package(
     summary_ja_md: str,
     image_paths: list[Path],
     work_dir: Path,
+    arxiv_id: str,
 ) -> Path:
     """Create a ZIP archive with all conversion outputs.
 
-    The resulting ZIP has the following structure::
+    The arXiv ID is prefixed onto every member filename so a user with
+    multiple ZIPs in one folder can distinguish them without renaming::
 
-        paper_en.md
-        paper_ja.md
-        summary_ja.md
-        images/
-            figure1.png
-            figure2.jpg
-            ...
+        <arxiv_id>.zip
+          <arxiv_id>_paper_en.md
+          <arxiv_id>_paper_ja.md
+          <arxiv_id>_summary_ja.md
+          images/
+              figure1.png
+              figure2.jpg
 
     Args:
         paper_en_md: English Markdown content of the paper.
@@ -44,16 +46,18 @@ def create_zip_package(
         summary_ja_md: Japanese summary Markdown content.
         image_paths: List of image file paths to include.
         work_dir: Working directory where the ZIP file will be created.
+        arxiv_id: arXiv paper ID (e.g. ``"2301.00001v2"``) used as the
+            filename prefix and the ZIP basename.
 
     Returns:
         Path to the created ZIP file.
     """
-    zip_path = work_dir / "output.zip"
+    zip_path = work_dir / f"{arxiv_id}.zip"
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("paper_en.md", paper_en_md)
-        zf.writestr("paper_ja.md", paper_ja_md)
-        zf.writestr("summary_ja.md", summary_ja_md)
+        zf.writestr(f"{arxiv_id}_paper_en.md", paper_en_md)
+        zf.writestr(f"{arxiv_id}_paper_ja.md", paper_ja_md)
+        zf.writestr(f"{arxiv_id}_summary_ja.md", summary_ja_md)
 
         for image_path in image_paths:
             if image_path.is_file():
@@ -79,6 +83,10 @@ def upload_to_s3(
 ) -> str:
     """Upload a ZIP file to S3 and return a presigned download URL.
 
+    The S3 key uses the ZIP's basename (which already encodes the arXiv ID)
+    so that browsers downloading the presigned URL save the file under the
+    same ``<arxiv_id>.zip`` name the local pipeline produced.
+
     Args:
         zip_path: Local path to the ZIP file.
         job_id: Job identifier used as the S3 key prefix.
@@ -88,7 +96,7 @@ def upload_to_s3(
     Returns:
         A presigned URL for downloading the uploaded ZIP.
     """
-    s3_key = f"jobs/{job_id}/output.zip"
+    s3_key = f"jobs/{job_id}/{zip_path.name}"
 
     s3_client = boto3.client("s3", config=Config(signature_version="s3v4"))
     s3_client.upload_file(
