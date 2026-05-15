@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.routes import init_routes, router
 from src.config import get_settings
 from src.services.job_manager import JobManager
+from src.services.pipeline_dispatcher import build_dispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +32,19 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     settings = get_settings()
     _configure_logging(settings.LOG_LEVEL)
 
-    # Initialize DynamoDB-backed JobManager
+    # Initialize DynamoDB-backed JobManager and the pipeline dispatcher.
+    # The dispatcher selects between Lambda invoke (prod) and an in-process
+    # asyncio task (local dev) based on PIPELINE_LAMBDA_NAME.
     job_manager = JobManager(
         table_name=settings.DYNAMODB_TABLE_NAME,
         endpoint_url=settings.DYNAMODB_ENDPOINT_URL,
         ttl_seconds=settings.JOB_TTL_SECONDS,
     )
-    init_routes(job_manager)
+    dispatcher = build_dispatcher(
+        job_manager=job_manager,
+        pipeline_lambda_name=settings.PIPELINE_LAMBDA_NAME,
+    )
+    init_routes(job_manager, dispatcher)
 
     logger.info(
         "arXiv Translator started (env=%s, log_level=%s)",

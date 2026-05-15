@@ -3,15 +3,19 @@
 Defines the following endpoints:
 - POST /api/v1/convert - Create a new conversion job
 - GET /api/v1/jobs/{job_id}/status - Poll job progress
+- GET /api/v1/jobs/{job_id}/download - Download the ZIP (local dev only)
 - GET /api/v1/health - Health check
+
+This module deliberately knows nothing about ``boto3``, ``asyncio``, or
+the pipeline implementation. Pipeline dispatch goes through the injected
+:class:`PipelineDispatcher`; persistence goes through the injected
+:class:`JobManager`. See ``services/pipeline_dispatcher.py``.
 """
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
-import boto3
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 
@@ -19,6 +23,7 @@ from src.api.auth import get_current_user
 from src.config import get_settings
 from src.models.api import ConvertRequest, ConvertResponse, ErrorResponse, HealthResponse, StatusResponse
 from src.services.job_manager import JobManager
+from src.services.pipeline_dispatcher import PipelineDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -27,18 +32,21 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _job_manager: JobManager | None = None
+_dispatcher: PipelineDispatcher | None = None
 
 
-def init_routes(job_manager: JobManager) -> None:
+def init_routes(job_manager: JobManager, dispatcher: PipelineDispatcher) -> None:
     """Inject shared service instances into the routes module.
 
     Called once during application startup from ``main.py``.
 
     Args:
         job_manager: The application-wide :class:`JobManager`.
+        dispatcher: The strategy used to start a pipeline run for a job.
     """
-    global _job_manager  # noqa: PLW0603
+    global _job_manager, _dispatcher  # noqa: PLW0603
     _job_manager = job_manager
+    _dispatcher = dispatcher
 
 
 def _get_job_manager() -> JobManager:
@@ -46,6 +54,13 @@ def _get_job_manager() -> JobManager:
     if _job_manager is None:
         raise RuntimeError("JobManager not initialized; call init_routes first")
     return _job_manager
+
+
+def _get_dispatcher() -> PipelineDispatcher:
+    """Return the shared PipelineDispatcher, raising if not initialized."""
+    if _dispatcher is None:
+        raise RuntimeError("PipelineDispatcher not initialized; call init_routes first")
+    return _dispatcher
 
 
 # ---------------------------------------------------------------------------
@@ -67,63 +82,21 @@ async def create_conversion(
 ) -> ConvertResponse:
     """Create a new arXiv paper conversion job.
 
-    Validates the URL, creates a job record in DynamoDB, and invokes
-    the pipeline Lambda asynchronously.
-
-    Returns 202 Accepted with the job ID and status polling URL.
+    Validates the URL, creates a job record in DynamoDB, and asks the
+    dispatcher to start the pipeline. Returns 202 Accepted with the job
+    ID and status polling URL.
     """
     job_manager = _get_job_manager()
-    settings = get_settings()
+    dispatcher = _get_dispatcher()
 
     job = await job_manager.create_job(body.arxiv_url)
-
-    if settings.PIPELINE_LAMBDA_NAME:
-        # Production: invoke pipeline Lambda asynchronously
-        lambda_client = boto3.client("lambda")
-        lambda_client.invoke(
-            FunctionName=settings.PIPELINE_LAMBDA_NAME,
-            InvocationType="Event",
-            Payload=json.dumps({"job_id": job.job_id, "arxiv_url": body.arxiv_url}),
-        )
-        logger.info("Invoked pipeline Lambda for job %s", job.job_id)
-    else:
-        # Local development: run pipeline in background task
-        import asyncio
-
-        from src.agents.orchestrator import run_pipeline
-
-        asyncio.create_task(
-            _run_pipeline_task(job.job_id, body.arxiv_url, job_manager, run_pipeline),
-        )
+    await dispatcher.dispatch(job.job_id, body.arxiv_url)
 
     return ConvertResponse(
         job_id=job.job_id,
         status="accepted",
         status_url=f"/api/v1/jobs/{job.job_id}/status",
     )
-
-
-async def _run_pipeline_task(
-    job_id: str,
-    arxiv_url: str,
-    job_manager: JobManager,
-    run_pipeline: Any,
-) -> None:
-    """Wrapper that runs the pipeline and handles final cleanup.
-
-    Used only in local development mode when no pipeline Lambda is configured.
-    """
-    try:
-        await run_pipeline(
-            arxiv_url=arxiv_url,
-            job_id=job_id,
-            job_manager=job_manager,
-        )
-    except Exception:
-        logger.exception("Pipeline task failed for job %s", job_id)
-        job = await job_manager.get_job(job_id)
-        if job and job.status != "error":
-            await job_manager.set_error(job_id, "Pipeline execution failed")
 
 
 @router.get(
