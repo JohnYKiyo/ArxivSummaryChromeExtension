@@ -33,9 +33,8 @@ ruff check src/ tests/                            # lint (configured in pyprojec
 ruff format src/ tests/                           # format
 mypy src/                                         # strict type check
 ```
-LLM evaluation tests hit the real Gemini API (require `GOOGLE_API_KEY`):
+LLM evaluation tests hit the real Gemini API (require `GOOGLE_API_KEY`). Only the LLM-driven stages have evals — TeX→Markdown is now deterministic via pandoc and doesn't need one:
 ```bash
-python -m tests.eval.eval_tex2markdown
 python -m tests.eval.eval_translation
 python -m tests.eval.eval_summary
 ```
@@ -72,18 +71,37 @@ cdk deploy --all             # deploy all stacks
 
 ### Backend pipeline (key reading: `backend/src/agents/orchestrator.py`)
 
-The conversion pipeline runs as a sequence of **independently-invoked Google ADK `LlmAgent`s**, NOT a `SequentialAgent`. This is intentional: each stage needs to write progress to DynamoDB between LLM calls, and non-LLM steps (arXiv fetch, ZIP packaging, S3 upload) need to interleave with LLM stages. `run_pipeline()` in `orchestrator.py` is the single source of truth for the flow:
+The conversion pipeline is a linear async function — **not** an ADK `SequentialAgent`. This is intentional: each stage writes progress to DynamoDB between calls, and the source-to-Markdown step is a deterministic library transform (not an LLM agent), so a SequentialAgent doesn't fit the shape.
+
+`run_pipeline()` in `orchestrator.py` is the single source of truth:
 
 ```
-fetch_arxiv_paper (non-LLM, src/tools/arxiv.py)
-  → tex2markdown agent       (src/agents/tex2markdown.py)
-  → translation agent        (src/agents/translation.py)
-  → summary agent            (src/agents/summary.py)
-  → create_zip_package       (src/tools/packaging.py)
-  → upload_to_s3 (prod) OR keep local (dev)
+fetch_arxiv_paper (src/tools/arxiv.py)
+  ├ kind="html" → html_to_markdown   (src/tools/html_to_markdown.py — markdownify)
+  └ kind="tex"  → tex_to_markdown    (src/tools/tex_to_markdown.py  — pandoc subprocess)
+                              ↓
+                  TranslationAgent   (src/agents/translation.py — LLM)
+                              ↓
+                  SummaryAgent       (src/agents/summary.py     — LLM)
+                              ↓
+                  create_zip_package (src/tools/packaging.py)
+                              ↓
+                  upload_to_s3 (prod) OR keep local (dev)
 ```
 
-Each agent runs via an ephemeral `InMemoryRunner` inside `_run_single_agent()`. Progress is reported via `JobManager.update_progress()` between stages using the `STAGES` table at the top of `orchestrator.py`.
+Source → Markdown is **deterministic** (library, no LLM): `markdownify` for HTML, `pandoc` for TeX. Only translation and summary call the LLM. Each LLM agent runs via an ephemeral `InMemoryRunner` inside `_run_single_agent()`; progress is reported via `JobManager.update_progress()` between stages using the `STAGES` table at the top of `orchestrator.py`.
+
+### Source fetching (`backend/src/tools/arxiv.py`)
+
+`fetch_arxiv_paper()` returns a `PaperSource` dataclass with `kind: "html" | "tex"`:
+
+1. **HTML-first** — try `arxiv.org/html/<id>`; if 200 HTML, use it. arxiv's HTML is LaTeXML-generated and converts well via `markdownify` with the `<article class="ltx_document">` selector and ``alttext`` extraction for math.
+2. **TeX fallback** — fetch `arxiv.org/e-print/<id>`. For multi-file submissions, `\input{...}` / `\include{...}` directives are recursively expanded so pandoc operates on a single self-contained document. Main file is picked by preferring files containing both `\documentclass` and `\begin{document}`.
+3. **PDF-only** — when the e-print is a PDF (no real TeX source) or just a `\includepdf` wrapper, raise `PdfOnlyPaperError`. The orchestrator catches this and surfaces a clear Japanese error message to the user.
+
+### Agent output extraction
+
+`_extract_final_text_async` returns the **longest text** seen across all ADK events, not the last one. Gemini emits multiple events per turn (thinking, streaming deltas, brief wrap-ups); naively keeping only the last leaves you with a short wrap message and loses the actual answer.
 
 ### Two-Lambda deployment (`infrastructure/cdk/stacks/backend_stack.py`)
 
@@ -124,20 +142,21 @@ The extension stores `apiUrl` and `lastCompletedJob` in `chrome.storage.local`. 
 
 Follow **SOLID, YAGNI, KISS, DRY, SoC**. These aren't decorations — they map to concrete rules below. When in doubt, prefer the simpler option and call it out.
 
-- **YAGNI** — Do not add config flags, abstract base classes, plugin hooks, or "for future use" parameters. If a need is one paper away, don't build the framework now. Recent example: the `SequentialAgent` / `TexFetchAgent` / `create_orchestrator_agent()` were removed precisely because they were YAGNI violations dressed up as flexibility.
-- **KISS** — Prefer a flat function over a class hierarchy. Prefer one file over five. `run_pipeline()` is intentionally a linear async function, not a state machine.
+- **YAGNI** — Do not add config flags, abstract base classes, plugin hooks, or "for future use" parameters. If a need is one paper away, don't build the framework now. Recent removals along this axis: the `SequentialAgent` / `TexFetchAgent` / `create_orchestrator_agent()`, and the `Tex2MarkdownAgent` (replaced by a pandoc subprocess once we realised a deterministic transform handled every case the LLM was doing).
+- **KISS** — Prefer a flat function over a class hierarchy. Prefer one file over five. `run_pipeline()` is intentionally a linear async function, not a state machine. When a deterministic library transform (markdownify, pandoc) replaces an LLM, take that trade — fewer calls, lower cost, more consistent output.
 - **DRY** — But don't deduplicate things that merely look similar. The polling logic in `useJobPolling.ts` (web) and `service-worker.ts` (extension) is duplicated *on purpose* — they run in different runtimes with different lifecycle constraints. Shared types/constants → extract; shared coincidence → leave alone.
 - **SoC** — Keep the layer boundaries strict:
-  - `agents/` = LLM prompt construction + ADK runner glue. **No** DynamoDB, **no** filesystem, **no** HTTP.
-  - `tools/` = pure I/O (arXiv fetch, ZIP, S3). **No** LLM calls.
+  - `agents/` = LLM prompt construction + ADK runner glue. Currently `translation`, `summary`, and `orchestrator`. **No** DynamoDB, **no** filesystem, **no** HTTP.
+  - `tools/` = pure I/O and deterministic transforms. `arxiv` (fetch + TeX extraction), `html_to_markdown` (markdownify), `tex_to_markdown` (pandoc), `packaging` (ZIP + S3). **No** LLM calls.
   - `services/job_manager.py` = the *only* code that talks to DynamoDB.
-  - `api/routes.py` = HTTP shape only; delegates to `JobManager` and `run_pipeline()`.
-  - `agents/orchestrator.py` = the only place that wires the above together.
+  - `services/pipeline_dispatcher.py` = the *only* code that decides between Lambda-invoke (prod) and in-process asyncio (dev).
+  - `api/routes.py` = HTTP shape only; delegates to `JobManager` and the dispatcher.
+  - `agents/orchestrator.py` = the only place that wires `tools/` and `agents/` together.
   Adding a DynamoDB import to `agents/` or an LLM call to `tools/` is a layering violation — push it up to the orchestrator.
 - **SOLID**:
   - **SRP** — One reason to change per module. If a PR touches both prompt text and DynamoDB schema, it's probably two PRs.
   - **OCP / LSP / ISP** — Rarely relevant in this codebase (few inheritance hierarchies). Don't invent abstractions to satisfy them.
-  - **DIP** — `JobManager` is injected into routes via `init_routes()` and into `run_pipeline()` via parameter. Keep it that way; don't reach for module-level singletons in new code.
+  - **DIP** — `JobManager` and the `PipelineDispatcher` are injected into routes via `init_routes()`. `JobManager` is also passed by parameter to `run_pipeline()`. Keep it that way; don't reach for module-level singletons in new code.
 
 When a change tempts you to break one of these (e.g., "I'll just import `boto3` here for one call"), stop and route it through the proper layer instead.
 
@@ -147,4 +166,6 @@ When a change tempts you to break one of these (e.g., "I'll just import `boto3` 
 - **Mypy**: strict mode is on. New code must type-check.
 - **Pytest**: `asyncio_mode = "auto"` — async tests don't need `@pytest.mark.asyncio`.
 - **Progress is int 0–100**, never float 0–1. The `* 100` conversion in old code was a bug from the SSE era.
-- **Don't add a `SequentialAgent`** to replace `run_pipeline()` — it was tried and removed because progress writes can't interleave inside an ADK sequential run.
+- **Don't add a `SequentialAgent`** to replace `run_pipeline()` — it was tried and removed because progress writes can't interleave inside an ADK sequential run, *and* because half the stages are deterministic library calls (not LLMs) that don't belong in an agent flow at all.
+- **ADK prompt placeholders**: agent `instruction` strings have `{var_name}` substituted from session state when `var_name` is a valid Python identifier. If you write `{filename}` or `{figure}` as a literal example in a prompt, ADK will raise `KeyError`. Either (a) use a non-identifier inside the braces — `{...}` is the easiest — or (b) describe the syntax in prose. The existing prompts in `agents/translation.py` and `agents/summary.py` follow this rule.
+- **Agent output extraction**: use the longest text across all events (`_extract_final_text_async`), not the last one. Gemini emits thinking/streaming/wrap-up events; the last is often a short ack while the actual answer is somewhere in the middle.

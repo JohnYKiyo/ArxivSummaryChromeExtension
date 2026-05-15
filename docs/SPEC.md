@@ -102,28 +102,40 @@ accepted → tex_fetch → tex2markdown → translation → summary → packagin
 }
 ```
 
-## 4. エージェントパイプライン
+## 4. パイプライン構成
 
-Google ADK を使用し、すべてのエージェントは AgentTool として実装されます。
+LLM (Google ADK) は **翻訳** と **要約** の 2 ステージだけで使用します。
+その他のステージは決定的なライブラリ変換 / I/O 処理です。
 
-### 4.1 OrchestratorAgent
+### 4.1 オーケストレーター (`agents/orchestrator.py`)
 
-パイプライン全体を制御するシーケンシャルコントローラー。各エージェントを順次呼び出し、進捗状況を DynamoDB に書き込みます。
+パイプライン全体を制御する線形 async 関数 `run_pipeline()`。各ステージ間で
+DynamoDB に進捗を書き込みます。ADK の `SequentialAgent` は使いません
+(進捗書き込みを挟めない、かつ半分のステージが LLM ではないため)。
 
-### 4.2 TexFetchAgent
+### 4.2 ソース取得 (`tools/arxiv.py`, 非 LLM)
 
-- arXiv から tar.gz ソースファイルをダウンロード
-- アーカイブを展開し、`.tex` ファイルと画像ファイルを抽出
+- HTML 優先: `arxiv.org/html/<id>` が 200 なら HTML を使用
+- TeX フォールバック: e-print の tar.gz を取得し、`\input` / `\include` を
+  再帰展開して単一文書に統合
+- PDF のみの論文は `PdfOnlyPaperError` で明示エラー
 
-### 4.3 Tex2MarkdownAgent
+### 4.3 ソース → Markdown 変換 (決定的)
 
-- LLM を使用して TeX を Markdown に変換
-- 以下の構造を保持:
-  - 画像参照
-  - 脚注
-  - 引用 (citations)
-  - 著者所属情報
-  - 数式（LaTeX 形式を維持）
+**LLM を使わない決定的変換**で行います。論文の取得形式に応じて 2 経路:
+
+- **HTML 経路** (`tools/html_to_markdown.py`): `arxiv.org/html/<id>` が利用可能な
+  場合に優先。`markdownify` で HTML → Markdown 変換。
+  `<math alttext="...">` の元 LaTeX を ``$...$`` / ``$$...$$`` に復元、
+  `<article class="ltx_document">` セレクタで本文だけを切り出す。
+- **TeX 経路** (`tools/tex_to_markdown.py`): HTML が無い場合は e-print の TeX
+  を取得し、`\input` / `\include` を再帰展開した単一文書を `pandoc` で
+  Markdown に変換。
+
+両方とも構造（見出し・箇条書き・表）、画像参照、数式 (``$...$``)、引用を保持。
+LLM 呼び出しがゼロなのでコスト・レイテンシ・安定性が向上。
+PDF のみの論文 (`\includepdf` ラッパー含む) は `PdfOnlyPaperError` で
+分かるエラーを返します。
 
 ### 4.4 TranslationAgent
 
@@ -195,35 +207,37 @@ ArxivSummaryChromeExtension/
 │   │   │   ├── __init__.py
 │   │   │   ├── routes.py
 │   │   │   └── auth.py
-│   │   ├── agents/
+│   │   ├── agents/                  # LLM-driven stages only
 │   │   │   ├── __init__.py
 │   │   │   ├── orchestrator.py
-│   │   │   ├── tex_fetch.py
-│   │   │   ├── tex2markdown.py
 │   │   │   ├── translation.py
 │   │   │   └── summary.py
-│   │   ├── tools/
+│   │   ├── tools/                   # I/O + deterministic transforms
 │   │   │   ├── __init__.py
-│   │   │   ├── arxiv.py
+│   │   │   ├── arxiv.py             # fetch + TeX extraction + PDF detection
+│   │   │   ├── html_to_markdown.py  # markdownify-based (arxiv.org/html)
+│   │   │   ├── tex_to_markdown.py   # pandoc-based (e-print TeX)
 │   │   │   └── packaging.py
 │   │   └── services/
 │   │       ├── __init__.py
-│   │       └── job_manager.py       # DynamoDB-backed job state
+│   │       ├── job_manager.py       # DynamoDB-backed job state
+│   │       └── pipeline_dispatcher.py  # prod (Lambda) vs dev (asyncio)
 │   └── tests/
 │       ├── __init__.py
 │       ├── conftest.py
 │       ├── test_agents/
 │       │   ├── __init__.py
 │       │   ├── test_tex_fetch.py
-│       │   ├── test_tex2markdown.py
 │       │   ├── test_translation.py
 │       │   └── test_summary.py
+│       ├── test_tools/
+│       │   ├── __init__.py
+│       │   └── test_tex_to_markdown.py
 │       ├── test_api/
 │       │   ├── __init__.py
 │       │   └── test_routes.py
-│       └── eval/
+│       └── eval/                    # LLM-stage evals only
 │           ├── __init__.py
-│           ├── eval_tex2markdown.py
 │           ├── eval_translation.py
 │           └── eval_summary.py
 ├── frontend/
@@ -274,10 +288,10 @@ sequenceDiagram
     participant ApiLambda as API Lambda
     participant DDB as DynamoDB
     participant PipeLambda as Pipeline Lambda
-    participant TF as TexFetchAgent
-    participant T2M as Tex2MarkdownAgent
-    participant TR as TranslationAgent
-    participant SM as SummaryAgent
+    participant Fetch as arxiv.py (fetch)
+    participant Conv as html_to_markdown / tex_to_markdown
+    participant TR as TranslationAgent (LLM)
+    participant SM as SummaryAgent (LLM)
     participant ArXiv as arxiv.org
     participant S3 as S3
 
@@ -294,14 +308,14 @@ sequenceDiagram
     ApiLambda-->>FE: {status, progress, current_step, message}
 
     PipeLambda->>DDB: status=tex_fetch
-    PipeLambda->>TF: TeX ソース取得
-    TF->>ArXiv: tar.gz ダウンロード
-    ArXiv-->>TF: ソースファイル
-    TF-->>PipeLambda: .tex + images
+    PipeLambda->>Fetch: ソース取得 (HTML優先、TeX フォールバック)
+    Fetch->>ArXiv: GET /html/{id} (200なら HTML、404なら e-print)
+    ArXiv-->>Fetch: HTML or tar.gz
+    Fetch-->>PipeLambda: PaperSource (kind, content, images)
 
     PipeLambda->>DDB: status=tex2markdown
-    PipeLambda->>T2M: TeX → Markdown 変換
-    T2M-->>PipeLambda: paper_en.md
+    PipeLambda->>Conv: 決定的変換 (markdownify or pandoc — LLM 不使用)
+    Conv-->>PipeLambda: paper_en.md
 
     PipeLambda->>DDB: status=translation
     PipeLambda->>TR: 英語 → 日本語翻訳

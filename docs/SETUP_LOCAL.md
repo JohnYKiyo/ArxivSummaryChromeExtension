@@ -192,10 +192,8 @@ pytest tests/ --cov=src --cov-report=html
 ```bash
 cd backend
 
-# Tex → Markdown 変換の評価
-python -m tests.eval.eval_tex2markdown
-
 # 翻訳の評価
+# (TeX → Markdown 変換は pandoc 経由で決定的に行うため eval は不要)
 python -m tests.eval.eval_translation
 
 # 要約の評価
