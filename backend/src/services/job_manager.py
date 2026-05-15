@@ -198,13 +198,14 @@ class JobManager:
             job_id: The unique job identifier.
             error: Human-readable error description.
         """
+        # NOTE: `error` is a DynamoDB reserved word — must alias via ExpressionAttributeNames.
         self._table.update_item(
             Key={"job_id": job_id},
             UpdateExpression=(
                 "SET #s = :status, progress = :prog, "
-                "error = :err, message = :msg, updated_at = :now"
+                "#e = :err, message = :msg, updated_at = :now"
             ),
-            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeNames={"#s": "status", "#e": "error"},
             ExpressionAttributeValues={
                 ":status": JobStatus.ERROR.value,
                 ":prog": 0,

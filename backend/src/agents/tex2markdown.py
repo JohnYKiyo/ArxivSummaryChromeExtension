@@ -14,6 +14,9 @@ _TEX2MD_INSTRUCTION = """\
 You are an expert TeX-to-Markdown converter. Your task is to convert the \
 provided TeX source into clean, well-structured Markdown.
 
+NOTE on the rules below: any placeholder inside braces is written as ``{...}`` \
+to denote arbitrary content; this is just our notation, not literal TeX.
+
 ## Conversion rules
 
 1. **Sections / headings**
@@ -22,19 +25,22 @@ provided TeX source into clean, well-structured Markdown.
    - ``\\subsubsection{...}`` → ``### ...``
 
 2. **Images / figures**
-   - ``\\includegraphics[...]{filename}`` → ``![caption](images/filename)``
-   - Use the caption from the surrounding ``\\begin{figure}...\\caption{...}`` \
-environment when available.
+   - For each ``\\includegraphics[...]{...}`` command, emit \
+``![caption](images/<basename>)``, where ``<basename>`` is the matching entry \
+from the supplied image paths.
+   - When the image sits inside a figure environment (``\\begin`` ... figure \
+... ``\\end``), use the surrounding ``\\caption{...}`` text as the caption.
    - If image path information is provided, use the actual paths listed there.
 
 3. **Footnotes**
-   - ``\\footnote{text}`` → ``[^N]`` inline plus ``[^N]: text`` at the bottom \
-of the section or document.
+   - ``\\footnote{...}`` → ``[^N]`` inline plus ``[^N]: ...`` at the bottom of \
+the section or document.
    - Number footnotes sequentially starting from 1.
 
 4. **Citations**
-   - ``\\cite{key}`` → ``[Author et al., Year]`` when author/year info is \
-available in the document; otherwise keep as ``[key]``.
+   - ``\\cite{...}`` → ``[Author et al., Year]`` when author/year info is \
+available in the document; otherwise keep the original citation key in square \
+brackets.
 
 5. **Author / affiliation metadata**
    - Render ``\\author`` and ``\\affiliation`` (or ``\\institute``) as a \
@@ -46,16 +52,17 @@ metadata block at the top of the document:
 
 6. **Mathematics**
    - Inline math ``$...$`` stays as ``$...$``.
-   - Display math ``$$...$$`` or ``\\[...\\]`` or ``\\begin{equation}...`` \
+   - Display math (``$$...$$``, ``\\[...\\]``, or the equation environment) \
 stays as ``$$...$$``.
    - Do NOT convert math to Unicode or any other format.
 
 7. **Tables**
-   - ``\\begin{tabular}`` → standard Markdown table with header separator.
+   - The tabular environment → standard Markdown table with header separator.
    - Preserve alignment where possible.
 
 8. **Lists**
-   - ``\\begin{itemize}`` / ``\\begin{enumerate}`` → ``-`` / ``1.`` lists.
+   - The itemize environment → ``-`` bullet list.
+   - The enumerate environment → ``1.`` numbered list.
 
 9. **Formatting**
    - ``\\textbf{...}`` → ``**...**``
@@ -64,8 +71,8 @@ stays as ``$$...$$``.
 
 10. **General**
     - Remove TeX preamble / package imports — they are not part of the content.
-    - Remove ``\\label{}``, ``\\ref{}``, ``\\newcommand`` and other TeX-only \
-directives that have no Markdown equivalent.
+    - Remove ``\\label{...}``, ``\\ref{...}``, ``\\newcommand`` and other \
+TeX-only directives that have no Markdown equivalent.
     - Preserve the logical ordering of the original document.
     - Process the **entire** document — do not truncate or summarise.
 

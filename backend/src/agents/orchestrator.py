@@ -81,6 +81,14 @@ async def _run_single_agent(
     user_id = "pipeline"
     session_id = str(uuid.uuid4())
 
+    # ADK >=0.3 requires sessions to exist before run_async; the runner
+    # no longer auto-creates them, so create_session() explicitly first.
+    await runner.session_service.create_session(
+        app_name=runner.app_name,
+        user_id=user_id,
+        session_id=session_id,
+    )
+
     content = genai_types.Content(
         role="user",
         parts=[genai_types.Part(text=user_message)],
