@@ -98,6 +98,23 @@ function stopPolling(): void {
   }
 }
 
+/**
+ * Resolve a download URL into an absolute URL the browser can open from
+ * the extension context. Backend returns either an absolute S3 presigned
+ * URL (production) or a path-only string like ``/api/v1/jobs/.../download``
+ * (local dev). A path-only string opened via ``chrome.tabs.create`` resolves
+ * against ``chrome-extension://<id>`` and 404s — prefix apiBaseUrl in that case.
+ */
+function resolveDownloadUrl(
+  url: string | null,
+  apiBaseUrl: string,
+  jobId: string
+): string {
+  if (!url) return `${apiBaseUrl}/api/v1/jobs/${jobId}/download`;
+  if (/^https?:\/\//i.test(url)) return url;
+  return `${apiBaseUrl}${url.startsWith("/") ? "" : "/"}${url}`;
+}
+
 // ── API ─────────────────────────────────────────────────
 
 async function getApiUrl(): Promise<string> {
@@ -206,8 +223,8 @@ function onConversionComplete(jobId: string, downloadUrl: string | null): void {
 
   downloadBtn.onclick = () => {
     // Use the download_url returned by the API (presigned S3 URL in production,
-    // local /download endpoint in development).
-    const url = downloadUrl ?? `${apiBaseUrl}/api/v1/jobs/${jobId}/download`;
+    // path-only /download endpoint in development — needs apiBaseUrl prefix).
+    const url = resolveDownloadUrl(downloadUrl, apiBaseUrl, jobId);
     chrome.tabs.create({ url });
   };
 }
@@ -281,18 +298,35 @@ async function init(): Promise<void> {
     // Not in a context where we can query tabs; ignore
   }
 
-  // Check if there's an active job from the background service worker.
+  // Restore the active job from the background service worker so closing
+  // and reopening the popup does not lose in-progress, completed, or errored
+  // jobs. The SW persists activeJob to chrome.storage.local, so this works
+  // even if the worker was killed between popup opens.
   try {
     const response = await chrome.runtime.sendMessage({ type: "GET_STATUS" });
-    if (response?.jobId && response?.status === "processing") {
-      const resumedJobId: string = response.jobId;
-      currentJobId = resumedJobId;
-      urlInput.value = response.arxivUrl || urlInput.value;
-      submitBtn.disabled = true;
-      submitBtn.textContent = "処理中...";
-      show(progressSection);
-      // Resume polling for the already-running job.
-      startPolling(resumedJobId);
+    if (response?.jobId) {
+      const restoredJobId: string = response.jobId;
+      currentJobId = restoredJobId;
+      if (response.arxivUrl) {
+        urlInput.value = response.arxivUrl;
+        urlHint.textContent = "前回の翻訳ジョブを復元しました";
+        urlHint.classList.add("detected");
+      }
+
+      if (response.status === "processing") {
+        submitBtn.disabled = true;
+        submitBtn.textContent = "処理中...";
+        show(progressSection);
+        const pct: number = response.progress ?? 0;
+        progressBar.style.width = `${pct}%`;
+        progressPercent.textContent = `${pct}%`;
+        startPolling(restoredJobId);
+      } else if (response.status === "complete") {
+        show(progressSection);
+        onConversionComplete(restoredJobId, response.downloadUrl ?? null);
+      } else if (response.status === "error") {
+        showError(response.error || "変換中にエラーが発生しました");
+      }
     }
   } catch {
     // No active job

@@ -13,6 +13,11 @@
 
 const DEFAULT_API_URL = "http://localhost:8000";
 const POLL_INTERVAL_MS = 3000;
+const ACTIVE_JOB_KEY = "activeJob";
+// Drop persisted jobs older than this — the backend's S3 presigned URL
+// (S3_PRESIGNED_URL_EXPIRY) and DynamoDB job TTL (JOB_TTL_SECONDS) are both
+// 1 h, so older entries can't be downloaded or re-queried anyway.
+const STALE_JOB_THRESHOLD_MS = 60 * 60 * 1000;
 
 // ── State ───────────────────────────────────────────────
 
@@ -22,6 +27,8 @@ interface JobState {
   status: "processing" | "complete" | "error";
   progress: number;
   downloadUrl: string | null;
+  error: string | null;
+  startedAt: number;
 }
 
 let activeJob: JobState | null = null;
@@ -49,6 +56,62 @@ function stopPolling(): void {
     clearInterval(pollingInterval);
     pollingInterval = null;
   }
+}
+
+/**
+ * Persist activeJob to chrome.storage.local so popup re-opens (and SW
+ * restarts) can recover the in-flight / completed state.
+ *
+ * MV3 service workers are killed after idle (especially after polling
+ * stops on completion), wiping the in-memory ``activeJob``. Without
+ * persistence, reopening the popup after completion shows a fresh UI
+ * even though the translation finished successfully.
+ */
+async function persistActiveJob(): Promise<void> {
+  if (activeJob) {
+    await chrome.storage.local.set({ [ACTIVE_JOB_KEY]: activeJob });
+  } else {
+    await chrome.storage.local.remove(ACTIVE_JOB_KEY);
+  }
+}
+
+/** Restore activeJob from storage on SW startup. */
+async function restoreActiveJob(): Promise<void> {
+  const result = await chrome.storage.local.get([ACTIVE_JOB_KEY]);
+  const stored: JobState | undefined = result[ACTIVE_JOB_KEY];
+  if (!stored) return;
+
+  if (Date.now() - stored.startedAt > STALE_JOB_THRESHOLD_MS) {
+    await chrome.storage.local.remove(ACTIVE_JOB_KEY);
+    return;
+  }
+
+  activeJob = stored;
+  if (stored.status === "processing") {
+    startPolling(stored.jobId);
+  } else if (stored.status === "error") {
+    setBadgeText("!");
+  } else {
+    setBadgeText("");
+  }
+}
+
+/**
+ * Resolve a download URL into an absolute URL the browser can open from
+ * the extension context. The backend returns either an absolute S3 presigned
+ * URL (production) or a path-only string like ``/api/v1/jobs/.../download``
+ * (local dev). A path-only string opened via ``chrome.tabs.create`` would
+ * resolve against ``chrome-extension://<id>`` and 404 — prefix the configured
+ * apiBaseUrl in that case.
+ */
+function resolveDownloadUrl(
+  url: string | null,
+  apiBaseUrl: string,
+  jobId: string
+): string {
+  if (!url) return `${apiBaseUrl}/api/v1/jobs/${jobId}/download`;
+  if (/^https?:\/\//i.test(url)) return url;
+  return `${apiBaseUrl}${url.startsWith("/") ? "" : "/"}${url}`;
 }
 
 // ── API Calls ───────────────────────────────────────────
@@ -79,7 +142,10 @@ async function startConversion(
       status: "processing",
       progress: 0,
       downloadUrl: null,
+      error: null,
+      startedAt: Date.now(),
     };
+    await persistActiveJob();
 
     startPolling(jobId);
 
@@ -142,10 +208,12 @@ async function pollJobStatus(jobId: string): Promise<void> {
     if (data.status === "error") {
       stopPolling();
       activeJob.status = "error";
+      activeJob.error = data.error || "変換中にエラーが発生しました";
+      await persistActiveJob();
       broadcastToTabs({
         type: "CONVERSION_ERROR",
         jobId,
-        error: data.error || "変換中にエラーが発生しました",
+        error: activeJob.error,
       });
       setBadgeText("!");
       return;
@@ -185,6 +253,9 @@ function handleConversionComplete(jobId: string, downloadUrl: string | null): vo
     activeJob.status = "complete";
     activeJob.progress = 100;
     activeJob.downloadUrl = downloadUrl;
+    persistActiveJob().catch((err) =>
+      console.error("[service-worker] persist failed:", err)
+    );
   }
 
   setBadgeText("");
@@ -193,11 +264,6 @@ function handleConversionComplete(jobId: string, downloadUrl: string | null): vo
     type: "CONVERSION_COMPLETE",
     jobId,
     downloadUrl,
-  });
-
-  // Store completed job for popup access
-  chrome.storage.local.set({
-    lastCompletedJob: { jobId, downloadUrl, timestamp: Date.now() },
   });
 }
 
@@ -232,18 +298,23 @@ chrome.runtime.onMessage.addListener(
       }
 
       case "GET_STATUS": {
-        sendResponse(
-          activeJob
-            ? {
-                jobId: activeJob.jobId,
-                arxivUrl: activeJob.arxivUrl,
-                status: activeJob.status,
-                progress: activeJob.progress,
-                downloadUrl: activeJob.downloadUrl,
-              }
-            : null
-        );
-        return false;
+        // Wait for the post-startup restore to finish so the popup gets the
+        // persisted state (not just whatever is in memory) on SW respawn.
+        restorePromise.then(() => {
+          sendResponse(
+            activeJob
+              ? {
+                  jobId: activeJob.jobId,
+                  arxivUrl: activeJob.arxivUrl,
+                  status: activeJob.status,
+                  progress: activeJob.progress,
+                  downloadUrl: activeJob.downloadUrl,
+                  error: activeJob.error,
+                }
+              : null
+          );
+        });
+        return true; // async response
       }
 
       case "UPDATE_BADGE": {
@@ -255,23 +326,19 @@ chrome.runtime.onMessage.addListener(
 
       case "DOWNLOAD_RESULT": {
         const jobId = message.jobId as string;
-        // Prefer the download_url from the completed job status response.
-        // Fall back to constructing the local-dev endpoint URL if unavailable.
-        const storedUrl =
-          activeJob?.jobId === jobId ? activeJob.downloadUrl : null;
-
-        if (storedUrl) {
-          chrome.tabs.create({ url: storedUrl });
+        (async () => {
+          // Ensure activeJob is restored from storage so we use the persisted
+          // download_url (presigned S3 URL or path-only local URL) when SW was
+          // killed and respawned between completion and click.
+          await restorePromise;
+          const storedUrl =
+            activeJob?.jobId === jobId ? activeJob.downloadUrl : null;
+          const apiUrl = await getApiUrl();
+          const url = resolveDownloadUrl(storedUrl, apiUrl, jobId);
+          chrome.tabs.create({ url });
           sendResponse({ success: true });
-        } else {
-          getApiUrl().then((apiUrl) => {
-            const fallbackUrl = `${apiUrl}/api/v1/jobs/${jobId}/download`;
-            chrome.tabs.create({ url: fallbackUrl });
-            sendResponse({ success: true });
-          });
-          return true; // async response
-        }
-        return false;
+        })();
+        return true; // async response
       }
 
       default:
@@ -286,4 +353,13 @@ chrome.runtime.onMessage.addListener(
 chrome.runtime.onInstalled.addListener(() => {
   console.log("[arXiv Translator] Extension installed/updated");
   setBadgeText("");
+});
+
+// ── Startup restore ─────────────────────────────────────
+// Fire-and-forget restoration kicked off at module evaluation. Avoids
+// top-level await, which can fail MV3 service-worker registration on some
+// Chrome versions (status code 3). Handlers that need the restored state
+// (GET_STATUS, DOWNLOAD_RESULT) await this promise before responding.
+const restorePromise: Promise<void> = restoreActiveJob().catch((err) => {
+  console.error("[service-worker] restore failed:", err);
 });
