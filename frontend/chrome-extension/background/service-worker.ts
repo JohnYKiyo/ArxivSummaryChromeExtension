@@ -210,16 +210,11 @@ async function pollJobStatus(jobId: string): Promise<void> {
       activeJob.status = "error";
       activeJob.error = data.error || "変換中にエラーが発生しました";
       await persistActiveJob();
-      broadcastToTabs({
-        type: "CONVERSION_ERROR",
-        jobId,
-        error: activeJob.error,
-      });
       setBadgeText("!");
       return;
     }
 
-    // Still in progress — update state and broadcast.
+    // Still in progress — update state.
     handleStatusUpdate(data, jobId);
   } catch (err) {
     console.error("[service-worker] poll error:", err);
@@ -238,14 +233,6 @@ function handleStatusUpdate(
   activeJob.progress = progress;
 
   setBadgeText(`${progress}%`);
-
-  broadcastToTabs({
-    type: "CONVERSION_PROGRESS",
-    jobId,
-    progress,
-    step: data.current_step || "",
-    message: data.message || "",
-  });
 }
 
 function handleConversionComplete(jobId: string, downloadUrl: string | null): void {
@@ -259,27 +246,6 @@ function handleConversionComplete(jobId: string, downloadUrl: string | null): vo
   }
 
   setBadgeText("");
-
-  broadcastToTabs({
-    type: "CONVERSION_COMPLETE",
-    jobId,
-    downloadUrl,
-  });
-}
-
-async function broadcastToTabs(message: Record<string, unknown>): Promise<void> {
-  try {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      if (tab.id) {
-        chrome.tabs.sendMessage(tab.id, message).catch(() => {
-          // Tab might not have content script; ignore
-        });
-      }
-    }
-  } catch {
-    // Ignore broadcast errors
-  }
 }
 
 // ── Message Listener ────────────────────────────────────

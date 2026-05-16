@@ -8,8 +8,6 @@
     "storage"
   ],
   "host_permissions": [
-    "https://arxiv.org/*",
-    "https://*.arxiv.org/*",
     "http://localhost:8000/*"
   ],
   "action": {
@@ -24,17 +22,6 @@
     "service_worker": "background/service-worker.js",
     "type": "module"
   },
-  "content_scripts": [
-    {
-      "matches": [
-        "https://arxiv.org/abs/*",
-        "https://arxiv.org/pdf/*"
-      ],
-      "js": ["content/content.js"],
-      "css": [],
-      "run_at": "document_idle"
-    }
-  ],
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
