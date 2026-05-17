@@ -26,6 +26,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from src.tools.math_normalize import normalize_math_macros
+
 logger = logging.getLogger(__name__)
 
 
@@ -109,6 +111,8 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
     if result.stderr:
         # Pandoc warns to stderr for unknown commands etc. — log at debug.
         logger.debug("pandoc stderr: %s", result.stderr.strip())
+
+    markdown = normalize_math_macros(markdown)
 
     logger.info("pandoc converted %d chars TeX → %d chars Markdown", len(tex_content), len(markdown))
     return markdown
