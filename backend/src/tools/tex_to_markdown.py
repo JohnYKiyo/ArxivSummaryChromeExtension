@@ -45,6 +45,21 @@ logger = logging.getLogger(__name__)
 _CITATION_AT_SIGN = re.compile(r"(?<![A-Za-z0-9_])@(?=[A-Za-z][\w:.\-]*)")
 _BRACKETED_TEXT = re.compile(r"\[([^\[\]\n]+)\]")
 
+# Image-reference rewriting. The TeX path ships every figure under
+# ``images/`` in the result ZIP (packaging.py:64), but pandoc emits bare
+# filenames as ``\includegraphics{name}`` → ``![](name)``. We rewrite to
+# ``![](images/name.ext)`` so the markdown actually points to the file
+# the user has on disk after unzipping. PDF/EPS extensions are rewritten
+# to ``.png`` because (a) we convert those at extraction time via
+# ``image_convert.convert_pdf_figures_to_png`` and (b) Obsidian / GitHub /
+# VS Code preview cannot render PDF or EPS inline.
+_RENDERABLE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"})
+_CONVERTED_TO_PNG_EXTS = frozenset({".pdf", ".eps"})
+# Markdown image with optional trailing attribute block; the block is dropped.
+_MD_IMAGE = re.compile(r"(!\[[^\]]*\])\(([^)\s]+)\)(?:\{[^{}]*\})?")
+# Raw HTML ``<img src="...">`` (pandoc emits these inside <figure> blocks).
+_HTML_IMG_SRC = re.compile(r'(<img\s+[^>]*?src=["\'])([^"\']+)(["\'])', re.IGNORECASE)
+
 
 class PandocNotInstalledError(RuntimeError):
     """Raised when the ``pandoc`` binary is not available on PATH."""
@@ -140,11 +155,59 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
         logger.debug("pandoc stderr: %s", result.stderr.strip())
 
     markdown = _strip_citation_at_signs(markdown)
+    markdown = _rewrite_image_paths(markdown)
     markdown = strip_math_labels(markdown)
     markdown = isolate_display_math(markdown)
 
     logger.info("pandoc converted %d chars TeX → %d chars Markdown", len(tex_content), len(markdown))
     return markdown
+
+
+def _rewrite_image_paths(markdown: str) -> str:
+    """Point every image reference at ``images/<basename>.<renderable-ext>``.
+
+    Pandoc emits figure references as bare filenames (``![](name)``) or
+    raw HTML (``<img src="name">`` inside ``<figure>`` blocks). Neither
+    form lines up with our ZIP layout (figures shipped under ``images/``)
+    nor with what Obsidian / GitHub renders (PDF/EPS not supported inline).
+
+    This rewrites both shapes to ``images/<basename>.<ext>``, mapping
+    ``.pdf`` / ``.eps`` to ``.png`` (the conversion already done at
+    extraction time by ``image_convert.convert_pdf_figures_to_png``) and
+    stripping pandoc's trailing ``{width="3in"}`` attribute blocks, which
+    standard Markdown viewers print as visible noise. External URLs
+    (``http(s)://``, ``data:``) and already-correct ``images/`` paths
+    pass through unchanged.
+    """
+
+    def _md_replace(match: re.Match[str]) -> str:
+        return f"{match.group(1)}({_to_renderable_image_path(match.group(2))})"
+
+    def _html_replace(match: re.Match[str]) -> str:
+        return f"{match.group(1)}{_to_renderable_image_path(match.group(2))}{match.group(3)}"
+
+    markdown = _MD_IMAGE.sub(_md_replace, markdown)
+    markdown = _HTML_IMG_SRC.sub(_html_replace, markdown)
+    return markdown
+
+
+def _to_renderable_image_path(src: str) -> str:
+    """Map an image source token to ``images/<basename>.<renderable-ext>``."""
+    if src.startswith(("http://", "https://", "data:")):
+        return src
+    name = src.split("/")[-1]
+    if "." in name:
+        stem, _, ext = name.rpartition(".")
+        ext_lower = "." + ext.lower()
+        if ext_lower in _CONVERTED_TO_PNG_EXTS:
+            return f"images/{stem}.png"
+        if ext_lower in _RENDERABLE_EXTS:
+            return f"images/{stem}.{ext}"
+        # Unknown extension: leave as-is under images/ — better than guessing.
+        return f"images/{name}"
+    # No extension. Pandoc passes through ``\includegraphics{name}`` as-is.
+    # Assume our PDF→PNG conversion produced ``name.png``.
+    return f"images/{name}.png"
 
 
 def _strip_citation_at_signs(markdown: str) -> str:

@@ -93,14 +93,18 @@ def test_section_levels(tmp_path: Path) -> None:
 
 
 def test_includegraphics_becomes_image_link(tmp_path: Path) -> None:
-    """``\\includegraphics`` should turn into a Markdown image reference."""
+    """``\\includegraphics`` should turn into a Markdown image reference.
+
+    Post-processing flattens directory components and prefixes ``images/``
+    to match where packaging.py stores figures in the result ZIP.
+    """
     tex = (
         r"\documentclass{article}\usepackage{graphicx}\begin{document}"
         r"\includegraphics{figures/fig1.png}"
         r"\end{document}"
     )
     md = tex_to_markdown(tex, work_dir=tmp_path)
-    assert "figures/fig1.png" in md
+    assert "images/fig1.png" in md
 
 
 def test_malformed_tex_raises_conversion_error(tmp_path: Path) -> None:
@@ -148,7 +152,7 @@ def test_image_drops_link_attributes(tmp_path: Path) -> None:
         r"\end{document}"
     )
     md = tex_to_markdown(tex, work_dir=tmp_path)
-    assert "figures/fig1.png" in md
+    assert "images/fig1.png" in md
     assert 'width="' not in md
 
 
@@ -160,7 +164,7 @@ def test_figure_environment_drops_fenced_div_wrapper(tmp_path: Path) -> None:
         r"\end{document}"
     )
     md = tex_to_markdown(tex, work_dir=tmp_path)
-    assert "figures/fig1.png" in md
+    assert "images/fig1.png" in md
     assert ":::" not in md
 
 
@@ -223,6 +227,88 @@ def test_footnote_ref_and_anchor_ref_are_preserved() -> None:
     md = "See note[^1] and section [TDDQ]."
     out = _strip_citation_at_signs(md)
     assert out == md
+
+
+# ---------------------------------------------------------------------------
+# _rewrite_image_paths
+# ---------------------------------------------------------------------------
+
+
+def test_markdown_image_pdf_extension_rewritten_to_png_under_images_dir() -> None:
+    from src.tools.tex_to_markdown import _rewrite_image_paths
+
+    md = "![image](function_overest.pdf){width=\"6.8in\"}"
+    out = _rewrite_image_paths(md)
+    assert out == "![image](images/function_overest.png)"
+
+
+def test_markdown_image_bare_name_gets_png_extension_and_images_prefix() -> None:
+    from src.tools.tex_to_markdown import _rewrite_image_paths
+
+    md = "![alt](Gaussian_bars)"
+    out = _rewrite_image_paths(md)
+    assert out == "![alt](images/Gaussian_bars.png)"
+
+
+def test_markdown_image_renderable_extension_preserved() -> None:
+    from src.tools.tex_to_markdown import _rewrite_image_paths
+
+    md = "![](photo.jpg) and ![](logo.svg)"
+    out = _rewrite_image_paths(md)
+    assert "images/photo.jpg" in out
+    assert "images/logo.svg" in out
+
+
+def test_markdown_image_external_url_left_alone() -> None:
+    from src.tools.tex_to_markdown import _rewrite_image_paths
+
+    md = "![](https://example.com/x.png)"
+    out = _rewrite_image_paths(md)
+    assert out == md
+
+
+def test_html_img_src_attribute_rewritten() -> None:
+    """Raw HTML ``<img>`` inside pandoc-emitted ``<figure>`` blocks gets rewritten."""
+    from src.tools.tex_to_markdown import _rewrite_image_paths
+
+    md = '<img src="Gaussian_bars" style="width:3.3in" />'
+    out = _rewrite_image_paths(md)
+    assert 'src="images/Gaussian_bars.png"' in out
+    # Other attributes preserved so width hint survives for Obsidian.
+    assert 'style="width:3.3in"' in out
+
+
+def test_html_img_with_pdf_extension_rewritten_to_png() -> None:
+    from src.tools.tex_to_markdown import _rewrite_image_paths
+
+    md = '<img src="figures/fig1.pdf" />'
+    out = _rewrite_image_paths(md)
+    assert 'src="images/fig1.png"' in out
+
+
+def test_image_subdir_components_dropped() -> None:
+    """``figures/sub/x.pdf`` flattens to ``images/x.png`` — packaging stores flat."""
+    from src.tools.tex_to_markdown import _rewrite_image_paths
+
+    md = "![](figures/sub/x.pdf)"
+    out = _rewrite_image_paths(md)
+    assert out == "![](images/x.png)"
+
+
+def test_pandoc_attribute_block_stripped_from_image() -> None:
+    from src.tools.tex_to_markdown import _rewrite_image_paths
+
+    md = "![alt](x.png){width=\"3in\" height=\"2in\"}"
+    out = _rewrite_image_paths(md)
+    assert "{" not in out
+    assert out == "![alt](images/x.png)"
+
+
+def test_rewrite_does_not_touch_prose() -> None:
+    from src.tools.tex_to_markdown import _rewrite_image_paths
+
+    md = "This sentence has no images and stays unchanged."
+    assert _rewrite_image_paths(md) == md
 
 
 def test_raises_when_pandoc_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

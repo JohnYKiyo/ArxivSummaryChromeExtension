@@ -26,6 +26,8 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from src.tools.image_convert import convert_pdf_figures_to_png
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -689,6 +691,12 @@ def fetch_arxiv_paper(url: str) -> PaperSource:
     extract_dir.mkdir(exist_ok=True)
 
     tex_content, image_paths = extract_source(source_path, extract_dir)
+    # Rasterise PDF figures to PNG so the eventual Markdown is renderable in
+    # Obsidian / GitHub / VS Code preview (none of which display PDFs
+    # inline). Done here, before pandoc, so pandoc's figure-file lookup
+    # against the extract directory finds the PNG when resolving
+    # ``\includegraphics{name}``.
+    image_paths = convert_pdf_figures_to_png(image_paths)
     return PaperSource(
         kind="tex",
         content=tex_content,
