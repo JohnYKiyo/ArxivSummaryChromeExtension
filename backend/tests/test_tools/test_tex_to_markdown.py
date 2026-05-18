@@ -311,6 +311,132 @@ def test_rewrite_does_not_touch_prose() -> None:
     assert _rewrite_image_paths(md) == md
 
 
+def test_html_embed_tag_canonicalised_to_img_with_png_path() -> None:
+    """``<embed src="x.pdf">`` (pandoc for PDF figures) → ``<img src="images/x.png">``."""
+    from src.tools.tex_to_markdown import _rewrite_image_paths
+
+    md = '<embed src="dqn_overestimation.pdf" style="width:70.0%" />'
+    out = _rewrite_image_paths(md)
+    assert "<embed" not in out
+    assert '<img' in out
+    assert 'src="images/dqn_overestimation.png"' in out
+    # Surrounding attributes (style) preserved so width hint survives.
+    assert 'style="width:70.0%"' in out
+
+
+def test_html_embed_two_on_same_line_both_rewritten() -> None:
+    from src.tools.tex_to_markdown import _rewrite_image_paths
+
+    md = '<embed src="a.pdf" /> <embed src="b.pdf" />'
+    out = _rewrite_image_paths(md)
+    assert out.count("<img") == 2
+    assert "<embed" not in out
+    assert "images/a.png" in out
+    assert "images/b.png" in out
+
+
+# ---------------------------------------------------------------------------
+# _strip_pandoc_div_wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_figure_div_wrapper_stripped_keeping_inner_content() -> None:
+    from src.tools.tex_to_markdown import _strip_pandoc_div_wrappers
+
+    md = (
+        '<div class="figure*">\n'
+        '<div class="center">\n'
+        '\n'
+        '<embed src="x.pdf" style="width:70.0%" />\n'
+        '\n'
+        '</div>\n'
+        '\n'
+        '</div>\n'
+        'After the figure.\n'
+    )
+    out = _strip_pandoc_div_wrappers(md)
+    assert '<div class' not in out
+    assert '</div>' not in out
+    assert '<embed src="x.pdf"' in out
+    assert "After the figure." in out
+
+
+def test_unmatched_close_div_kept() -> None:
+    """If a stray ``</div>`` has no matching figure open, leave it alone."""
+    from src.tools.tex_to_markdown import _strip_pandoc_div_wrappers
+
+    md = '</div>\nfollowed by text'
+    out = _strip_pandoc_div_wrappers(md)
+    # We didn't see an opening wrapper, so we don't pop a close.
+    assert "</div>" in out
+
+
+def test_non_figure_div_is_left_alone() -> None:
+    """A ``<div class="warning">`` (not figure/center) is preserved as-is."""
+    from src.tools.tex_to_markdown import _strip_pandoc_div_wrappers
+
+    md = '<div class="warning">\nBeware!\n</div>\n'
+    out = _strip_pandoc_div_wrappers(md)
+    assert '<div class="warning">' in out
+    assert '</div>' in out
+
+
+# ---------------------------------------------------------------------------
+# _strip_pandoc_crossrefs
+# ---------------------------------------------------------------------------
+
+
+def test_pandoc_eqref_link_replaced_by_text() -> None:
+    from src.tools.tex_to_markdown import _strip_pandoc_crossrefs
+
+    md = (
+        'See <a href="#TDQ" data-reference-type="eqref" '
+        'data-reference="TDQ">[TDQ]</a> for details.'
+    )
+    out = _strip_pandoc_crossrefs(md)
+    assert out == "See [TDQ] for details."
+
+
+def test_pandoc_ref_link_replaced_by_text() -> None:
+    from src.tools.tex_to_markdown import _strip_pandoc_crossrefs
+
+    md = (
+        'Figure <a href="#fig:dqn_overest" data-reference-type="ref" '
+        'data-reference="fig:dqn_overest">[fig:dqn_overest]</a>.'
+    )
+    out = _strip_pandoc_crossrefs(md)
+    assert out == "Figure [fig:dqn_overest]."
+
+
+def test_ordinary_link_left_alone() -> None:
+    """A normal ``<a href="...">`` without ``data-reference-type`` survives."""
+    from src.tools.tex_to_markdown import _strip_pandoc_crossrefs
+
+    md = 'See <a href="https://example.com">the docs</a>.'
+    out = _strip_pandoc_crossrefs(md)
+    assert out == md
+
+
+def test_table_uses_pipe_or_html_format(tmp_path: Path) -> None:
+    """A header-less TeX table must not come out as ``simple_tables``."""
+    tex = (
+        r"\documentclass{article}\begin{document}"
+        r"\begin{tabular}{lcr}"
+        r"Median & 93.5\% & 114.7\% \\"
+        r"Mean   & 241.1\% & 330.3\% \\"
+        r"\end{tabular}"
+        r"\end{document}"
+    )
+    md = tex_to_markdown(tex, work_dir=tmp_path)
+    # simple_tables-style horizontal rule (only dashes and spaces) must not
+    # appear — that's the format that Obsidian / GitHub / VS Code don't render.
+    has_dash_rule = bool(re.search(r"^\s*-+\s+-+", md, re.MULTILINE))
+    assert not has_dash_rule, f"Table came out as simple_tables format:\n{md}"
+    # Content should still be there in some form (pipe or HTML).
+    assert "93.5" in md
+    assert "114.7" in md
+
+
 def test_raises_when_pandoc_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """If pandoc isn't on PATH, we should raise PandocNotInstalledError."""
     monkeypatch.setattr("src.tools.tex_to_markdown.shutil.which", lambda _name: None)

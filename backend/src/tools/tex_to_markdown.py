@@ -57,8 +57,33 @@ _RENDERABLE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"})
 _CONVERTED_TO_PNG_EXTS = frozenset({".pdf", ".eps"})
 # Markdown image with optional trailing attribute block; the block is dropped.
 _MD_IMAGE = re.compile(r"(!\[[^\]]*\])\(([^)\s]+)\)(?:\{[^{}]*\})?")
-# Raw HTML ``<img src="...">`` (pandoc emits these inside <figure> blocks).
-_HTML_IMG_SRC = re.compile(r'(<img\s+[^>]*?src=["\'])([^"\']+)(["\'])', re.IGNORECASE)
+# Raw HTML ``<img src="...">`` or ``<embed src="...pdf">`` (pandoc emits
+# ``<embed>`` for PDFs since the spec says PDFs can't go in ``<img>``).
+# We canonicalise both to ``<img>`` because we've already converted PDFs
+# to PNGs upstream — ``<img src="...png">`` works everywhere.
+_HTML_IMG_OR_EMBED = re.compile(
+    r"<(?:img|embed)\b([^>]*?)src=[\"']([^\"']+)[\"']([^>]*?)\s*/?>",
+    re.IGNORECASE,
+)
+
+# Pandoc ``<div class="figure*">`` / ``<div class="figure">`` / ``<div class="center">``
+# wrappers around figure environments. Each opener is paired with a ``</div>``
+# at the same nesting level. Standard Markdown viewers ignore the class
+# attribute (so the wrapper does nothing visually but adds clutter), and
+# stripping it lets the inner ``<img>`` or markdown render directly.
+_DIV_WRAPPER_OPEN = re.compile(r'^<div class="(?:figure\*?|center)">\s*$')
+_DIV_CLOSE = re.compile(r"^</div>\s*$")
+
+# Pandoc ``<a href="#anchor" data-reference-type="ref" data-reference="...">text</a>``
+# emitted for ``\ref{...}`` / ``\eqref{...}`` cross-references. The
+# ``data-*`` attributes are pandoc-specific; standard Markdown viewers
+# show the whole ``<a>`` raw. Internal anchors aren't resolved either
+# (we don't emit matching ``id=""`` on headings). Drop the wrapper —
+# keep the inner text.
+_PANDOC_CROSSREF = re.compile(
+    r"<a\s+[^>]*?\bdata-reference-type=[\"'][^\"']*[\"'][^>]*>([^<]*)</a>",
+    re.IGNORECASE,
+)
 
 
 class PandocNotInstalledError(RuntimeError):
@@ -84,7 +109,24 @@ class PandocConversionError(RuntimeError):
 #                        ``::: figure* ... :::`` blocks which standard MD
 #                        renders verbatim. The inner content survives.
 _PANDOC_FROM = "latex"
-_PANDOC_TO = "markdown+tex_math_dollars+pipe_tables-raw_tex-header_attributes-link_attributes-fenced_divs"
+# Disabled table extensions: pandoc otherwise picks ``simple_tables`` for
+# header-less tables or ``multiline_tables`` for wide cells — neither is
+# recognised by Obsidian / GitHub / VS Code preview, which all render
+# them as preformatted text. Forcing only ``pipe_tables`` makes pandoc
+# fall back to raw HTML ``<table>`` for tables that don't fit pipe
+# format, and HTML tables do render in every viewer.
+_PANDOC_TO = (
+    "markdown"
+    "+tex_math_dollars"
+    "+pipe_tables"
+    "-raw_tex"
+    "-header_attributes"
+    "-link_attributes"
+    "-fenced_divs"
+    "-simple_tables"
+    "-multiline_tables"
+    "-grid_tables"
+)
 _PANDOC_FLAGS: tuple[str, ...] = (
     "--wrap=none",
     "--from=" + _PANDOC_FROM,
@@ -155,12 +197,53 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
         logger.debug("pandoc stderr: %s", result.stderr.strip())
 
     markdown = _strip_citation_at_signs(markdown)
+    markdown = _strip_pandoc_div_wrappers(markdown)
+    markdown = _strip_pandoc_crossrefs(markdown)
     markdown = _rewrite_image_paths(markdown)
     markdown = strip_math_labels(markdown)
     markdown = isolate_display_math(markdown)
 
     logger.info("pandoc converted %d chars TeX → %d chars Markdown", len(tex_content), len(markdown))
     return markdown
+
+
+def _strip_pandoc_div_wrappers(markdown: str) -> str:
+    """Remove ``<div class="figure*|center">`` wrappers, keeping inner content.
+
+    Pandoc emits a raw HTML ``<div>`` wrapping each figure environment when
+    ``fenced_divs`` is disabled. The class attribute carries information
+    pandoc itself uses for re-import but is invisible to standard Markdown
+    viewers, which still render the bare opener/closer tags as preformatted
+    text on their own lines.
+
+    We strip the openers we recognise and pop a matching ``</div>`` for
+    each one. Other ``<div>`` blocks (if the source somehow has them) are
+    left alone.
+    """
+    out: list[str] = []
+    pending_closes = 0
+    for line in markdown.split("\n"):
+        if _DIV_WRAPPER_OPEN.match(line.strip()):
+            pending_closes += 1
+            continue
+        if pending_closes > 0 and _DIV_CLOSE.match(line.strip()):
+            pending_closes -= 1
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _strip_pandoc_crossrefs(markdown: str) -> str:
+    """Replace ``<a data-reference-type="..." ...>text</a>`` with ``text``.
+
+    pandoc emits raw HTML anchors for ``\\ref{...}`` / ``\\eqref{...}``
+    with ``data-reference-type`` / ``data-reference`` attributes that
+    only its own re-import understands. Standard viewers print the full
+    ``<a ...>`` tag. The anchor target wouldn't resolve in Markdown
+    anyway (we don't emit ``id=""`` on headings), so the link adds no
+    value — keep the inner text.
+    """
+    return _PANDOC_CROSSREF.sub(lambda m: m.group(1), markdown)
 
 
 def _rewrite_image_paths(markdown: str) -> str:
@@ -184,10 +267,13 @@ def _rewrite_image_paths(markdown: str) -> str:
         return f"{match.group(1)}({_to_renderable_image_path(match.group(2))})"
 
     def _html_replace(match: re.Match[str]) -> str:
-        return f"{match.group(1)}{_to_renderable_image_path(match.group(2))}{match.group(3)}"
+        attrs_before = match.group(1)
+        attrs_after = match.group(3)
+        new_src = _to_renderable_image_path(match.group(2))
+        return f'<img{attrs_before}src="{new_src}"{attrs_after} />'
 
     markdown = _MD_IMAGE.sub(_md_replace, markdown)
-    markdown = _HTML_IMG_SRC.sub(_html_replace, markdown)
+    markdown = _HTML_IMG_OR_EMBED.sub(_html_replace, markdown)
     return markdown
 
 
