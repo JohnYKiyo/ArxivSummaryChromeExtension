@@ -201,12 +201,21 @@ def test_citation_at_sign_stripped_in_multi_key_citation(tmp_path: Path) -> None
     assert "b" in md
 
 
-def test_at_sign_outside_brackets_is_preserved() -> None:
-    """A bare ``@username`` in prose (not citation) must stay as-is."""
-    # Use the post-processor directly so we don't need pandoc here.
+def test_in_text_citation_at_sign_stripped() -> None:
+    """pandoc emits ``@Key`` (no brackets) for in-text citations too."""
     from src.tools.tex_to_markdown import _strip_citation_at_signs
 
-    md = "Follow @alice for updates. Email her@example.com."
+    md = "as @Mnih:2015 showed, Q-learning overestimates."
+    out = _strip_citation_at_signs(md)
+    assert "@" not in out
+    assert "Mnih:2015" in out
+
+
+def test_email_addresses_preserved_by_lookbehind() -> None:
+    """``her@example.com`` and similar must not be treated as citations."""
+    from src.tools.tex_to_markdown import _strip_citation_at_signs
+
+    md = "Email her@example.com or me@host."
     out = _strip_citation_at_signs(md)
     assert out == md
 
@@ -381,6 +390,26 @@ def test_non_figure_div_is_left_alone() -> None:
     assert '</div>' in out
 
 
+def test_id_only_div_wrapper_stripped() -> None:
+    """``<div id="tableresults">`` (label anchor, no class) is also a wrapper."""
+    from src.tools.tex_to_markdown import _strip_pandoc_div_wrappers
+
+    md = '<div id="tableresults">\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n</div>\n'
+    out = _strip_pandoc_div_wrappers(md)
+    assert '<div' not in out
+    assert '</div>' not in out
+    assert '| a | b |' in out
+
+
+def test_div_with_id_and_figure_class_stripped() -> None:
+    from src.tools.tex_to_markdown import _strip_pandoc_div_wrappers
+
+    md = '<div id="fig1" class="figure*">\ninner\n</div>\n'
+    out = _strip_pandoc_div_wrappers(md)
+    assert '<div' not in out
+    assert "inner" in out
+
+
 # ---------------------------------------------------------------------------
 # _strip_pandoc_crossrefs
 # ---------------------------------------------------------------------------
@@ -415,6 +444,65 @@ def test_ordinary_link_left_alone() -> None:
     md = 'See <a href="https://example.com">the docs</a>.'
     out = _strip_pandoc_crossrefs(md)
     assert out == md
+
+
+# ---------------------------------------------------------------------------
+# _convert_table_captions
+# ---------------------------------------------------------------------------
+
+
+def test_table_caption_converted_to_numbered_bold_label() -> None:
+    """``: caption`` after a pipe table → ``**Table 1:** caption``."""
+    from src.tools.tex_to_markdown import _convert_table_captions
+
+    md = (
+        "|  a  |  b  |\n"
+        "|:---:|:---:|\n"
+        "|  1  |  2  |\n"
+        "\n"
+        ": Summary of results.\n"
+    )
+    out = _convert_table_captions(md)
+    assert "**Table 1:** Summary of results." in out
+    assert "\n: Summary" not in out
+
+
+def test_multiple_table_captions_numbered_sequentially() -> None:
+    from src.tools.tex_to_markdown import _convert_table_captions
+
+    md = (
+        "| h |\n|---|\n| x |\n\n"
+        ": First caption.\n\n"
+        "| h |\n|---|\n| y |\n\n"
+        ": Second caption.\n"
+    )
+    out = _convert_table_captions(md)
+    assert "**Table 1:** First caption." in out
+    assert "**Table 2:** Second caption." in out
+
+
+def test_definition_list_colon_not_treated_as_caption() -> None:
+    """``: definition`` NOT preceded by a pipe table must stay untouched."""
+    from src.tools.tex_to_markdown import _convert_table_captions
+
+    md = "Term\n: A definition that is not a table caption.\n"
+    out = _convert_table_captions(md)
+    assert out == md
+
+
+def test_colon_line_far_from_table_not_converted() -> None:
+    """Caption detection requires the IMMEDIATELY preceding non-blank line
+    to be a pipe row."""
+    from src.tools.tex_to_markdown import _convert_table_captions
+
+    md = (
+        "| h |\n|---|\n| x |\n\n"
+        "Some prose between table and colon line.\n\n"
+        ": Not a caption — there was prose in between.\n"
+    )
+    out = _convert_table_captions(md)
+    assert "**Table" not in out
+    assert ": Not a caption" in out
 
 
 def test_table_uses_pipe_or_html_format(tmp_path: Path) -> None:

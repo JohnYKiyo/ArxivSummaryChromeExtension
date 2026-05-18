@@ -40,10 +40,12 @@ logger = logging.getLogger(__name__)
 # without depending on the pandoc-citation extension.
 #
 # Match ``@`` that's at a word boundary (preceded by a non-identifier char)
-# and followed by an identifier-shaped citation key. Limited to text inside
-# ``[...]`` so Twitter-style ``@user`` mentions outside brackets are safe.
+# and followed by an identifier-shaped citation key. Applied globally so
+# in-text citations (``as @Mnih:2015 showed``) and bracketed forms
+# (``[@Mnih:2015]``) are both cleaned. The lookbehind excludes
+# email-like ``user@example.com`` and any ``@`` preceded by identifier
+# characters, which is the conservative thing for academic prose.
 _CITATION_AT_SIGN = re.compile(r"(?<![A-Za-z0-9_])@(?=[A-Za-z][\w:.\-]*)")
-_BRACKETED_TEXT = re.compile(r"\[([^\[\]\n]+)\]")
 
 # Image-reference rewriting. The TeX path ships every figure under
 # ``images/`` in the result ZIP (packaging.py:64), but pandoc emits bare
@@ -66,12 +68,19 @@ _HTML_IMG_OR_EMBED = re.compile(
     re.IGNORECASE,
 )
 
-# Pandoc ``<div class="figure*">`` / ``<div class="figure">`` / ``<div class="center">``
-# wrappers around figure environments. Each opener is paired with a ``</div>``
-# at the same nesting level. Standard Markdown viewers ignore the class
-# attribute (so the wrapper does nothing visually but adds clutter), and
-# stripping it lets the inner ``<img>`` or markdown render directly.
-_DIV_WRAPPER_OPEN = re.compile(r'^<div class="(?:figure\*?|center)">\s*$')
+# Pandoc raw HTML ``<div>`` wrappers emitted for ``figure*`` / ``figure`` /
+# ``center`` environments and for any environment carrying a ``\label{...}``
+# (which pandoc turns into ``<div id="label">``). All three are
+# pandoc-specific structural hints with no visible effect in standard
+# viewers — bare opener / closer tags appear as preformatted text.
+# We accept ``id`` and/or the figure-flavoured ``class`` attribute in
+# either order; ``<div class="theorem">`` and other named classes are
+# left alone since they may convey real document structure.
+_DIV_WRAPPER_OPEN = re.compile(
+    r"^<div"
+    r'(?:\s+(?:id="[^"]*"|class="(?:figure\*?|center)"))+'
+    r"\s*>\s*$"
+)
 _DIV_CLOSE = re.compile(r"^</div>\s*$")
 
 # Pandoc ``<a href="#anchor" data-reference-type="ref" data-reference="...">text</a>``
@@ -199,12 +208,48 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
     markdown = _strip_citation_at_signs(markdown)
     markdown = _strip_pandoc_div_wrappers(markdown)
     markdown = _strip_pandoc_crossrefs(markdown)
+    markdown = _convert_table_captions(markdown)
     markdown = _rewrite_image_paths(markdown)
     markdown = strip_math_labels(markdown)
     markdown = isolate_display_math(markdown)
 
     logger.info("pandoc converted %d chars TeX → %d chars Markdown", len(tex_content), len(markdown))
     return markdown
+
+
+def _convert_table_captions(markdown: str) -> str:
+    """Turn pandoc pipe-table captions (``: caption``) into ``**Table N:** ...``.
+
+    Pandoc places a pipe-table caption on a line of its own, starting with
+    ``: ``, immediately (with one blank line gap) after the table. Standard
+    Markdown viewers do not recognise this syntax — Obsidian / GitHub /
+    VS Code preview all show the literal ``: caption``. Convert each
+    such caption into a numbered, bold ``**Table N:** caption`` label so
+    it reads like the original paper's table caption.
+
+    Detection is intentionally conservative: a line is only treated as a
+    caption when the previous non-blank line is a pipe-table row (starts
+    AND ends with ``|``). Definition-list ``: definition`` constructs
+    that don't follow a table are left alone.
+    """
+    lines = markdown.split("\n")
+    out: list[str] = []
+    last_nonblank_was_pipe_row = False
+    table_count = 0
+    for line in lines:
+        stripped = line.strip()
+        if last_nonblank_was_pipe_row and stripped.startswith(": "):
+            table_count += 1
+            indent = line[: len(line) - len(line.lstrip())]
+            out.append(f"{indent}**Table {table_count}:** {stripped[2:]}")
+            last_nonblank_was_pipe_row = False
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            last_nonblank_was_pipe_row = True
+        elif stripped:
+            last_nonblank_was_pipe_row = False
+        out.append(line)
+    return "\n".join(out)
 
 
 def _strip_pandoc_div_wrappers(markdown: str) -> str:
@@ -297,25 +342,18 @@ def _to_renderable_image_path(src: str) -> str:
 
 
 def _strip_citation_at_signs(markdown: str) -> str:
-    """Convert pandoc citation tokens ``[@key]`` into plain labels ``[key]``.
+    """Convert pandoc citation tokens ``@key`` / ``[@key]`` into plain labels.
 
     Pandoc's ``citations`` extension turns ``\\cite{Lin:1992}`` into the
-    Markdown token ``[@Lin:1992]``. Standard Markdown viewers (Obsidian,
-    GitHub, VS Code preview) do not recognise this and render it verbatim,
-    which is just visual noise. Disabling the ``citations`` extension is
-    not an alternative — pandoc then drops the citation entirely, leaving
-    sentences with dangling commas and spaces.
+    Markdown token ``[@Lin:1992]`` and bare ``@Lin:1992`` for in-text
+    forms (``as @Lin:1992 showed``). Standard Markdown viewers do not
+    recognise either and render them verbatim. Disabling the extension
+    is not an alternative — pandoc then drops the citation entirely,
+    leaving dangling commas.
 
     Stripping the ``@`` keeps the citation key visible as a label and
-    works in every renderer. Untouched if the bracketed span contains no
-    ``@`` (so Markdown links ``[text](url)``, footnote refs ``[^1]`` and
-    pandoc cross-refs ``[\\[eq\\]]`` pass through unchanged).
+    works in every renderer. The lookbehind in ``_CITATION_AT_SIGN``
+    protects email addresses (``her@example.com``) and any other ``@``
+    that is glued to a preceding identifier character.
     """
-
-    def _clean(match: re.Match[str]) -> str:
-        body = match.group(1)
-        if "@" not in body:
-            return match.group(0)
-        return f"[{_CITATION_AT_SIGN.sub('', body)}]"
-
-    return _BRACKETED_TEXT.sub(_clean, markdown)
+    return _CITATION_AT_SIGN.sub("", markdown)
