@@ -120,6 +120,50 @@ def test_malformed_tex_raises_conversion_error(tmp_path: Path) -> None:
         pass
 
 
+def test_unnumbered_section_drops_header_attributes(tmp_path: Path) -> None:
+    """``\\section*{Foo}`` must not leak ``{#foo .unnumbered}`` syntax.
+
+    Pandoc's default markdown output appends ``{#anchor .class}`` to every
+    heading via the ``header_attributes`` extension. Standard Markdown
+    viewers (GitHub, Obsidian, VS Code preview) render this verbatim.
+    We disable that extension in the writer.
+    """
+    tex = (
+        r"\documentclass{article}\begin{document}"
+        r"\section*{Deep Reinforcement Learning with Double Q-learning}"
+        r"Body."
+        r"\end{document}"
+    )
+    md = tex_to_markdown(tex, work_dir=tmp_path)
+    assert "Deep Reinforcement Learning with Double Q-learning" in md
+    assert ".unnumbered" not in md
+    assert "{#deep-reinforcement-learning-with-double-q-learning" not in md
+
+
+def test_image_drops_link_attributes(tmp_path: Path) -> None:
+    """Image width specifiers must not appear as ``{width="6.8in"}`` in MD."""
+    tex = (
+        r"\documentclass{article}\usepackage{graphicx}\begin{document}"
+        r"\includegraphics[width=6.8in]{figures/fig1.png}"
+        r"\end{document}"
+    )
+    md = tex_to_markdown(tex, work_dir=tmp_path)
+    assert "figures/fig1.png" in md
+    assert 'width="' not in md
+
+
+def test_figure_environment_drops_fenced_div_wrapper(tmp_path: Path) -> None:
+    """``\\begin{figure*}...\\end{figure*}`` must not produce ``::: figure*`` wrappers."""
+    tex = (
+        r"\documentclass{article}\usepackage{graphicx}\begin{document}"
+        r"\begin{figure*}\includegraphics{figures/fig1.png}\end{figure*}"
+        r"\end{document}"
+    )
+    md = tex_to_markdown(tex, work_dir=tmp_path)
+    assert "figures/fig1.png" in md
+    assert ":::" not in md
+
+
 def test_raises_when_pandoc_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """If pandoc isn't on PATH, we should raise PandocNotInstalledError."""
     monkeypatch.setattr("src.tools.tex_to_markdown.shutil.which", lambda _name: None)

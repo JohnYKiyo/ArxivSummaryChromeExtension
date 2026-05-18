@@ -39,8 +39,20 @@ class PandocConversionError(RuntimeError):
 
 # Pandoc options. Kept module-level so the choice is easy to audit and the
 # command is identical between production runs and tests.
+#
+# Disabled extensions explained:
+#   - raw_tex          : we don't want raw TeX leaking into the Markdown
+#   - header_attributes: pandoc emits ``# Heading {#anchor .unnumbered}``
+#                        which renders as literal text in GitHub, Obsidian,
+#                        VS Code preview, etc.
+#   - link_attributes  : pandoc emits ``[text](url){reference-type="eqref"
+#                        reference="X"}`` for cross-refs and ``{width="3in"}``
+#                        for images — same problem, shows as noise.
+#   - fenced_divs      : pandoc wraps figure*/table* environments in
+#                        ``::: figure* ... :::`` blocks which standard MD
+#                        renders verbatim. The inner content survives.
 _PANDOC_FROM = "latex"
-_PANDOC_TO = "markdown+tex_math_dollars+pipe_tables-raw_tex"
+_PANDOC_TO = "markdown+tex_math_dollars+pipe_tables-raw_tex-header_attributes-link_attributes-fenced_divs"
 _PANDOC_FLAGS: tuple[str, ...] = (
     "--wrap=none",
     "--from=" + _PANDOC_FROM,
