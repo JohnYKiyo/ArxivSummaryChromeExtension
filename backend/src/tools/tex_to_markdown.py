@@ -21,12 +21,27 @@ This module performs no LLM calls and lives in ``tools/`` (not
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# Pandoc citations: ``\cite{Lin:1992}`` becomes ``[@Lin:1992]`` in Markdown
+# via the ``citations`` extension. Disabling that extension makes pandoc
+# drop the citations entirely (leaving dangling commas), so we keep the
+# extension on and strip the ``@`` marker post-pandoc so the rendered
+# text is a plain ``[Lin:1992]`` label — readable in every Markdown viewer
+# without depending on the pandoc-citation extension.
+#
+# Match ``@`` that's at a word boundary (preceded by a non-identifier char)
+# and followed by an identifier-shaped citation key. Limited to text inside
+# ``[...]`` so Twitter-style ``@user`` mentions outside brackets are safe.
+_CITATION_AT_SIGN = re.compile(r"(?<![A-Za-z0-9_])@(?=[A-Za-z][\w:.\-]*)")
+_BRACKETED_TEXT = re.compile(r"\[([^\[\]\n]+)\]")
 
 
 class PandocNotInstalledError(RuntimeError):
@@ -122,5 +137,32 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
         # Pandoc warns to stderr for unknown commands etc. — log at debug.
         logger.debug("pandoc stderr: %s", result.stderr.strip())
 
+    markdown = _strip_citation_at_signs(markdown)
+
     logger.info("pandoc converted %d chars TeX → %d chars Markdown", len(tex_content), len(markdown))
     return markdown
+
+
+def _strip_citation_at_signs(markdown: str) -> str:
+    """Convert pandoc citation tokens ``[@key]`` into plain labels ``[key]``.
+
+    Pandoc's ``citations`` extension turns ``\\cite{Lin:1992}`` into the
+    Markdown token ``[@Lin:1992]``. Standard Markdown viewers (Obsidian,
+    GitHub, VS Code preview) do not recognise this and render it verbatim,
+    which is just visual noise. Disabling the ``citations`` extension is
+    not an alternative — pandoc then drops the citation entirely, leaving
+    sentences with dangling commas and spaces.
+
+    Stripping the ``@`` keeps the citation key visible as a label and
+    works in every renderer. Untouched if the bracketed span contains no
+    ``@`` (so Markdown links ``[text](url)``, footnote refs ``[^1]`` and
+    pandoc cross-refs ``[\\[eq\\]]`` pass through unchanged).
+    """
+
+    def _clean(match: re.Match[str]) -> str:
+        body = match.group(1)
+        if "@" not in body:
+            return match.group(0)
+        return f"[{_CITATION_AT_SIGN.sub('', body)}]"
+
+    return _BRACKETED_TEXT.sub(_clean, markdown)

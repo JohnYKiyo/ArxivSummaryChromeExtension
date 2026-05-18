@@ -164,6 +164,67 @@ def test_figure_environment_drops_fenced_div_wrapper(tmp_path: Path) -> None:
     assert ":::" not in md
 
 
+def test_citation_at_sign_stripped_from_brackets(tmp_path: Path) -> None:
+    """``\\cite{Key}`` must end up as a clean ``[Key]`` label.
+
+    Pandoc emits ``[@Key]`` via its citations extension. Standard Markdown
+    viewers render this verbatim ("@" visible), so we strip the ``@``
+    post-pandoc to keep just the citation key as a readable label.
+    """
+    tex = (
+        r"\documentclass{article}\begin{document}"
+        r"For experience replay~\cite{Lin:1992}, see also \cite{Mnih:2015}."
+        r"\end{document}"
+    )
+    md = tex_to_markdown(tex, work_dir=tmp_path)
+    assert "[Lin:1992]" in md
+    assert "[Mnih:2015]" in md
+    assert "[@Lin:1992]" not in md
+    assert "[@Mnih:2015]" not in md
+
+
+def test_citation_at_sign_stripped_in_multi_key_citation(tmp_path: Path) -> None:
+    """``\\cite{a,b}`` → ``[@a; @b]`` → ``[a; b]`` (both ``@`` removed)."""
+    tex = (
+        r"\documentclass{article}\begin{document}"
+        r"See \cite{a,b}."
+        r"\end{document}"
+    )
+    md = tex_to_markdown(tex, work_dir=tmp_path)
+    assert "@" not in md
+    # Both keys remain, separated by pandoc's semicolon-list form.
+    assert "a" in md
+    assert "b" in md
+
+
+def test_at_sign_outside_brackets_is_preserved() -> None:
+    """A bare ``@username`` in prose (not citation) must stay as-is."""
+    # Use the post-processor directly so we don't need pandoc here.
+    from src.tools.tex_to_markdown import _strip_citation_at_signs
+
+    md = "Follow @alice for updates. Email her@example.com."
+    out = _strip_citation_at_signs(md)
+    assert out == md
+
+
+def test_markdown_link_with_at_in_brackets_is_preserved() -> None:
+    """Don't munge a link whose text contains ``@`` but isn't a citation."""
+    from src.tools.tex_to_markdown import _strip_citation_at_signs
+
+    # Pandoc citation has @key at word boundary; "@foo@bar" doesn't match.
+    md = "[foo@bar.com](mailto:foo@bar.com)"
+    out = _strip_citation_at_signs(md)
+    assert out == md
+
+
+def test_footnote_ref_and_anchor_ref_are_preserved() -> None:
+    from src.tools.tex_to_markdown import _strip_citation_at_signs
+
+    md = "See note[^1] and section [TDDQ]."
+    out = _strip_citation_at_signs(md)
+    assert out == md
+
+
 def test_raises_when_pandoc_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """If pandoc isn't on PATH, we should raise PandocNotInstalledError."""
     monkeypatch.setattr("src.tools.tex_to_markdown.shutil.which", lambda _name: None)
