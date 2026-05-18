@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 
 _DISPLAY_MATH = re.compile(r"\$\$([\s\S]+?)\$\$")
+_LABEL_IN_MATH = re.compile(r"\\label\s*\{[^{}]*\}")
 _EXCESS_BLANK_LINES = re.compile(r"\n{3,}")
 
 
@@ -43,3 +44,29 @@ def isolate_display_math(markdown: str) -> str:
 
     out = _DISPLAY_MATH.sub(_replace, markdown)
     return _EXCESS_BLANK_LINES.sub("\n\n", out)
+
+
+def strip_math_labels(markdown: str) -> str:
+    """Remove ``\\label{...}`` from inside ``$$...$$`` display math blocks.
+
+    Pandoc emits a label when the source TeX was
+    ``\\begin{equation}\\label{eq:foo}...\\end{equation}`` — but the
+    flattened output places the label directly inside a bare ``$$...$$``,
+    detached from its equation environment. Obsidian's MathJax 3 cannot
+    associate the orphaned ``\\label`` with a numbered environment and
+    silently fails to render the entire equation. Other renderers
+    (GitHub MathJax, VS Code preview) at best render the label as
+    visible junk, at worst error out.
+
+    Stripping the label removes a feature (cross-referencing) that
+    already does not work in standard Markdown viewers — there is no
+    equation numbering to link to — while restoring the equation's
+    visual rendering. Inline ``$...$`` math is left alone since
+    ``\\label`` does not appear there in practice.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        cleaned = _LABEL_IN_MATH.sub("", match.group(1))
+        return f"$${cleaned}$$"
+
+    return _DISPLAY_MATH.sub(_replace, markdown)
