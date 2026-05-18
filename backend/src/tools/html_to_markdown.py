@@ -20,6 +20,8 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup, NavigableString, Tag
 from markdownify import markdownify as _markdownify
 
+from src.tools.markdown_layout import isolate_display_math
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,6 +102,7 @@ def html_to_markdown(html: str, base_url: str | None = None) -> str:
     )
 
     markdown = _restore_math(markdown, math_sources)
+    markdown = isolate_display_math(markdown)
     markdown = _EXCESS_BLANK_LINES.sub("\n\n", markdown)
     return markdown.strip() + "\n"
 

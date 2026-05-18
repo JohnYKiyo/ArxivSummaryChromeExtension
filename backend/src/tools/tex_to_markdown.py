@@ -27,6 +27,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from src.tools.markdown_layout import isolate_display_math
+
 logger = logging.getLogger(__name__)
 
 
@@ -138,6 +140,7 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
         logger.debug("pandoc stderr: %s", result.stderr.strip())
 
     markdown = _strip_citation_at_signs(markdown)
+    markdown = isolate_display_math(markdown)
 
     logger.info("pandoc converted %d chars TeX → %d chars Markdown", len(tex_content), len(markdown))
     return markdown

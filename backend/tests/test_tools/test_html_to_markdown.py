@@ -135,4 +135,7 @@ def test_math_alttext_still_preserved_in_body() -> None:
     """
     md = html_to_markdown(html)
     assert r"$\mathcal{L}$" in md
-    assert r"$$\sum_{i=1}^{n} x_i$$" in md
+    # Display math is isolated onto its own paragraph by markdown_layout —
+    # the body survives intact across line breaks.
+    assert r"\sum_{i=1}^{n} x_i" in md
+    assert "$$\n\\sum_{i=1}^{n} x_i\n$$" in md
