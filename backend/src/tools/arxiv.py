@@ -550,14 +550,47 @@ def _strip_environment(tex: str, env: str) -> str:
     return pattern.sub("", tex)
 
 
+def _strip_tex_line_comments(tex: str) -> str:
+    """Remove TeX ``%`` line-comments (``%`` to end of line).
+
+    Author / title templates commonly use the ``%\\n`` line-continuation
+    idiom (``Name%\\n\\\\\\nAffiliation%\\n``) so paragraphs join without
+    intervening space. Once we collapse whitespace for downstream
+    consumption the ``%`` would extend its comment to the rest of the
+    collapsed line (i.e. the entire input), accidentally swallowing
+    everything that follows it inside ``\\section*{}`` / ``\\textit{}``.
+    Strip the comment portion explicitly before any whitespace work.
+    """
+    return re.sub(r"%[^\n]*", "", tex)
+
+
+def _clean_title(title: str) -> str:
+    """Normalise a TeX ``\\title{}`` payload for inclusion in ``\\section*{}``.
+
+    Authors sometimes attach ``\\thanks{...}`` (a footnote command meant
+    for ``\\maketitle``) directly to the title text. Embedding that
+    inside ``\\section*{...}`` is ill-formed for pandoc — the multi-line
+    ``\\thanks{}`` body containing parentheses and special punctuation
+    trips pandoc's parser. Strip ``\\thanks{...}`` plus TeX line
+    comments and collapse whitespace so the resulting heading is just
+    the bare title text.
+    """
+    cleaned = _strip_tex_line_comments(title)
+    cleaned = _strip_command(cleaned, "thanks")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
 def _clean_author_list(authors: str) -> str:
     """Normalise a TeX ``\\author{}`` payload into a comma-separated string.
 
+    - Drops TeX ``%`` line comments (common ``%\\n`` continuation idiom).
     - Strips ``\\thanks{...}`` blocks (affiliations / emails attached per author).
     - Replaces ``\\and`` and ``\\\\`` separators with commas.
     - Collapses whitespace and dedupes adjacent commas.
     """
-    cleaned = _strip_command(authors, "thanks")
+    cleaned = _strip_tex_line_comments(authors)
+    cleaned = _strip_command(cleaned, "thanks")
     cleaned = re.sub(r"\\and\b", ",", cleaned)
     cleaned = re.sub(r"\\\\", ",", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
@@ -599,7 +632,7 @@ def _extract_metadata_and_rewrite(tex: str) -> str:
 
     block_parts: list[str] = []
     if title_inner is not None:
-        block_parts.append("\\section*{" + title_inner.strip() + "}")
+        block_parts.append("\\section*{" + _clean_title(title_inner) + "}")
     if author_inner is not None:
         authors = _clean_author_list(author_inner)
         if authors:

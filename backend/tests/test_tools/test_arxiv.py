@@ -200,6 +200,66 @@ def test_extract_metadata_icml_template_recognised() -> None:
     assert r"\icmlkeywords" not in out
 
 
+def test_clean_author_list_strips_percent_line_comments() -> None:
+    """TeX ``%\\n`` line-continuation must not survive whitespace collapse.
+
+    Real-world ``\\author{}`` bodies (e.g. arXiv 2508.15817) use
+    ``Name%\\n\\\\\\nAffiliation%\\n`` so paragraphs join without space.
+    After our cleaner runs we would emit a single-line string where the
+    ``%`` would extend its comment to the end of the line — swallowing
+    everything inside the surrounding ``\\textit{...}`` and crashing
+    pandoc downstream with ``unexpected ()`` errors.
+    """
+    raw = (
+        "{\\large Alice}%\n"
+        "\\thanks{Corresponding.} \\\\%\n"
+        "ACME Corp \\\\%\n"
+        "{\\footnotesize \\url{alice@acme.com}} \\and\n"
+        "{\\large Bob}%\n"
+        " \\\\%\n"
+        "ACME Corp \\\\%\n"
+        "{\\footnotesize \\url{bob@acme.com}}"
+    )
+    out = _clean_author_list(raw)
+    assert "%" not in out
+    # Both author names survive; both ACME mentions survive too (since
+    # we don't try to deduplicate affiliations here).
+    assert "Alice" in out
+    assert "Bob" in out
+
+
+def test_extract_metadata_title_thanks_block_stripped() -> None:
+    """``\\title{T\\thanks{...}}`` must not embed the footnote inside the
+    synthesized ``\\section*{...}`` heading. The ``\\thanks`` body often has
+    parentheses and multi-line content that breaks pandoc when nested
+    inside a ``\\section*`` argument.
+    """
+    tex = "\n".join(
+        [
+            r"\documentclass{article}",
+            r"\title{Meet Your New Client: Writing Reports for AI -- Benchmarking",
+            r"Information Loss\thanks{We thank participants of the workshop",
+            r"(DGOF) for the discussion.}}",
+            r"\author{A}",
+            r"\begin{document}",
+            r"\maketitle",
+            r"\begin{abstract}X\end{abstract}",
+            r"Body",
+            r"\end{document}",
+        ]
+    )
+    out = _extract_metadata_and_rewrite(tex)
+    # Title heading carries only the bare title text — no \thanks.
+    assert (
+        r"\section*{Meet Your New Client: Writing Reports for AI -- Benchmarking"
+        r" Information Loss}"
+    ) in out
+    # The thanks block is gone (no parentheses-containing footnote inside
+    # the heading).
+    assert r"\thanks" not in out
+    assert "(DGOF)" not in out
+
+
 def test_extract_metadata_does_not_match_longer_command_names() -> None:
     """``\\maketitlefigure`` (a different command) must not be mistaken for
     ``\\maketitle``."""
