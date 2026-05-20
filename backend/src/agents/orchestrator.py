@@ -31,7 +31,7 @@ from src.config import get_settings
 from src.models.job import JobStatus
 from src.tools.arxiv import PdfOnlyPaperError, fetch_arxiv_paper
 from src.tools.packaging import create_zip_package, upload_to_s3
-from src.tools.tex_to_markdown import tex_to_markdown
+from src.tools.tex_to_markdown import PandocConversionError, tex_to_markdown
 
 if TYPE_CHECKING:
     from src.services.job_manager import JobManager
@@ -277,6 +277,20 @@ async def run_pipeline(
             await job_manager.set_error(
                 job_id,
                 "この論文は PDF 版のみ提供されており、HTML/TeX ソースがないため変換できません。",
+            )
+        return results
+
+    except PandocConversionError as exc:
+        # Pandoc rejected the TeX source. Common causes are malformed
+        # author syntax that LaTeX itself silently tolerates (and that
+        # the cite-normaliser doesn't already cover). Surface the actual
+        # pandoc error so users / maintainers can see which construct
+        # broke the parse.
+        logger.warning("Pipeline [%s] aborted: pandoc failed (%s)", job_id, exc)
+        if job_manager is not None:
+            await job_manager.set_error(
+                job_id,
+                f"TeX ソースの構文を pandoc が解釈できませんでした: {exc}",
             )
         return results
 

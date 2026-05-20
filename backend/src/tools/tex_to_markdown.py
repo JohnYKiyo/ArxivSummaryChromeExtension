@@ -117,6 +117,17 @@ class PandocConversionError(RuntimeError):
 #   - fenced_divs      : pandoc wraps figure*/table* environments in
 #                        ``::: figure* ... :::`` blocks which standard MD
 #                        renders verbatim. The inner content survives.
+# Malformed citation arguments authors sometimes commit:
+#   \cite{,Key}      — leading comma
+#   \cite{Key,}      — trailing comma
+#   \cite{A,,B}      — duplicate comma
+#   \cite{ , Key }   — whitespace-padded
+# LaTeX itself silently accepts these. Pandoc's strict parser aborts with
+# ``unexpected ,`` (exit 64) on the leading-comma form. Fix in the input
+# layer so pandoc gets a clean citation list. Matches the whole ``cite``
+# family (``\cite``, ``\citep``, ``\citet``, ``\citeyear`` etc.).
+_CITE_FAMILY = re.compile(r"\\(cite[a-zA-Z]*)(\[[^\]]*\])*\s*\{([^{}]*)\}")
+
 _PANDOC_FROM = "latex"
 # Disabled table extensions: pandoc otherwise picks ``simple_tables`` for
 # header-less tables or ``multiline_tables`` for wide cells — neither is
@@ -180,6 +191,8 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
     if work_dir is None:
         work_dir = Path(tempfile.mkdtemp(prefix="pandoc_"))
 
+    tex_content = _normalise_cite_args(tex_content)
+
     tex_path = work_dir / "_pandoc_input.tex"
     tex_path.write_text(tex_content, encoding="utf-8")
 
@@ -215,6 +228,33 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
 
     logger.info("pandoc converted %d chars TeX → %d chars Markdown", len(tex_content), len(markdown))
     return markdown
+
+
+def _normalise_cite_args(tex: str) -> str:
+    """Strip stray commas from ``\\cite{...}`` arguments.
+
+    LaTeX tolerates malformed citation lists such as ``\\cite{,Key}`` or
+    ``\\cite{A,,B}``; pandoc's strict parser aborts (exit 64,
+    ``unexpected ,``) and the whole pipeline fails. Common author typos
+    that we normalise:
+
+    * leading ``,``  — ``\\cite{,Key}``     → ``\\cite{Key}``
+    * trailing ``,`` — ``\\cite{Key,}``     → ``\\cite{Key}``
+    * doubled ``,``  — ``\\cite{A,,B}``     → ``\\cite{A,B}``
+    * whitespace      — ``\\cite{ A , B }`` → ``\\cite{A,B}``
+
+    Handles the whole ``cite`` family (``\\citep``, ``\\citet``,
+    ``\\citeyear``, etc.) including an optional ``[prenote]``/``[postnote]``
+    argument. Other commands and prose are untouched.
+    """
+
+    def _clean(match: re.Match[str]) -> str:
+        cmd = match.group(1)
+        optional_args = match.group(2) or ""
+        keys = [k.strip() for k in match.group(3).split(",") if k.strip()]
+        return f"\\{cmd}{optional_args}{{{','.join(keys)}}}"
+
+    return _CITE_FAMILY.sub(_clean, tex)
 
 
 def _convert_table_captions(markdown: str) -> str:

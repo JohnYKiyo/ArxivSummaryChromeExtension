@@ -201,6 +201,46 @@ def test_citation_at_sign_stripped_in_multi_key_citation(tmp_path: Path) -> None
     assert "b" in md
 
 
+def test_cite_with_leading_comma_normalised(tmp_path: Path) -> None:
+    """``\\cite{,Key}`` (author typo) must not break the pandoc pipeline.
+
+    LaTeX silently tolerates this; pandoc aborts with ``unexpected ,``
+    (exit 64). The preprocessor strips the stray comma so pandoc gets a
+    clean argument and the pipeline completes.
+    """
+    tex = (
+        r"\documentclass{article}\begin{document}"
+        r"See~\cite{,Yuqietal-2023-PatchTST} for details."
+        r"\end{document}"
+    )
+    md = tex_to_markdown(tex, work_dir=tmp_path)
+    assert "Yuqietal-2023-PatchTST" in md
+
+
+def test_cite_with_trailing_and_doubled_commas_normalised() -> None:
+    """``\\cite{A,,B,}`` → ``\\cite{A,B}``."""
+    from src.tools.tex_to_markdown import _normalise_cite_args
+
+    tex = r"\cite{A,,B,} and \citep[p.~5]{,X}"
+    out = _normalise_cite_args(tex)
+    assert out == r"\cite{A,B} and \citep[p.~5]{X}"
+
+
+def test_cite_with_only_commas_becomes_empty() -> None:
+    """``\\cite{,,}`` is meaningless; collapse to ``\\cite{}`` rather than crash."""
+    from src.tools.tex_to_markdown import _normalise_cite_args
+
+    out = _normalise_cite_args(r"\cite{,,}")
+    assert out == r"\cite{}"
+
+
+def test_normal_cite_passes_through_unchanged() -> None:
+    from src.tools.tex_to_markdown import _normalise_cite_args
+
+    tex = r"See \cite{Mnih:2015,Lin:1992} and \citet{vanHasselt:2010}."
+    assert _normalise_cite_args(tex) == tex
+
+
 def test_in_text_citation_at_sign_stripped() -> None:
     """pandoc emits ``@Key`` (no brackets) for in-text citations too."""
     from src.tools.tex_to_markdown import _strip_citation_at_signs
