@@ -645,17 +645,26 @@ def extract_source(tar_path: Path, output_dir: Path) -> tuple[str, list[Path]]:
 
 
 def fetch_arxiv_paper(url: str) -> PaperSource:
-    """Fetch an arXiv paper, preferring HTML over TeX source.
+    """Fetch an arXiv paper via the TeX e-print archive.
 
-    Tries the HTML version first (``arxiv.org/html/<id>``); if unavailable,
-    falls back to the e-print TeX archive. Raises :class:`PdfOnlyPaperError`
-    for PDF-only papers.
+    Previously this preferred LaTeXML's HTML rendering, but in practice
+    LaTeXML's output for many papers contains preamble leakage
+    (``\\NewDocumentCommand``, ``\\makesavenoteenv``), ``\\citeproc``
+    citation residue, ``\\thanks`` inlined into titles, and emails
+    resolved as relative URLs — none of which the HTML path's
+    post-processing reliably catches. The TeX path through pandoc, with
+    the post-processors in ``tex_to_markdown``, produces a noticeably
+    cleaner Markdown.
+
+    Raises :class:`PdfOnlyPaperError` for PDF-only papers (no TeX
+    source available).
 
     Args:
         url: An arXiv URL or bare arXiv paper ID.
 
     Returns:
-        A :class:`PaperSource` describing the fetched content.
+        A :class:`PaperSource` describing the fetched content (always
+        ``kind="tex"``).
 
     Raises:
         ValueError: If ``url`` is not a recognisable arXiv reference.
@@ -667,25 +676,6 @@ def fetch_arxiv_paper(url: str) -> PaperSource:
     work_dir = Path(tempfile.mkdtemp(prefix=f"arxiv_{arxiv_id}_"))
     logger.info("Working directory: %s", work_dir)
 
-    # 1. Try the HTML version first.
-    html_result = try_fetch_html(arxiv_id)
-    if html_result is not None:
-        html, final_url = html_result
-        # final_url is the post-redirect page URL (e.g. .../1706.03762v7);
-        # urljoin treats its last path component as a "filename" and uses
-        # the parent for relative resolution, which is exactly the browser
-        # rule we need for ``<img src="1706.03762v7/Figures/X.png">``.
-        images_dir = work_dir / "html_images"
-        rewritten_html, image_paths = _download_html_images(html, final_url, images_dir)
-        return PaperSource(
-            kind="html",
-            content=rewritten_html,
-            work_dir=work_dir,
-            arxiv_id=arxiv_id,
-            images=image_paths,
-        )
-
-    # 2. Fall back to the TeX e-print source.
     source_path = download_arxiv_source(arxiv_id, work_dir)
     extract_dir = work_dir / "source"
     extract_dir.mkdir(exist_ok=True)

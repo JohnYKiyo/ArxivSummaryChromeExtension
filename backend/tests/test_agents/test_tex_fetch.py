@@ -17,7 +17,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-import requests
 
 from src.tools.arxiv import (
     PaperSource,
@@ -247,115 +246,41 @@ def _mock_response(
 
 
 class TestFetchArxivPaper:
-    """Behaviour of the HTML-first, TeX-fallback ``fetch_arxiv_paper``."""
+    """Behaviour of TeX-only ``fetch_arxiv_paper``.
 
-    def test_html_version_is_preferred(self) -> None:
-        """When the HTML endpoint returns 200 HTML, that path is used.
+    The HTML path (LaTeXML → markdownify) was disabled because its output
+    contained preamble leakage, inlined ``\\thanks`` titles, and emails
+    treated as relative URLs that the post-processor could not reliably
+    repair. All papers now go through the TeX e-print archive.
+    """
 
-        The HTML body in this fixture has no ``<img>``, so the image
-        downloader runs but downloads nothing — the only outbound request
-        should be the HTML fetch itself.
-        """
-        html_body = b"<!DOCTYPE html><html><body><p>Hello arXiv</p></body></html>"
-        html_response = _mock_response(content=html_body, content_type="text/html")
-
-        with patch("src.tools.arxiv.requests.get", return_value=html_response) as mocked:
-            paper = fetch_arxiv_paper("https://arxiv.org/abs/2301.00001")
-
-        assert isinstance(paper, PaperSource)
-        assert paper.kind == "html"
-        assert "Hello arXiv" in paper.content
-        assert paper.images == []
-        # Only the HTML endpoint should have been called.
-        assert mocked.call_count == 1
-
-    def test_html_images_are_downloaded_and_rewritten(self, tmp_path: Path) -> None:
-        """``<img>`` references should be fetched and rewritten to local paths."""
-        html_body = (
-            b"<!DOCTYPE html><html><body>"
-            b'<img src="extracted/fig1.png" alt="fig1">'
-            b'<img src="extracted/fig2.svg" alt="fig2">'
-            b"</body></html>"
-        )
-        png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
-        svg_bytes = b"<svg/>"
-
-        html_response = _mock_response(content=html_body, content_type="text/html")
-        png_response = _mock_response(content=png_bytes, content_type="image/png")
-        svg_response = _mock_response(content=svg_bytes, content_type="image/svg+xml")
-
-        # Three sequential calls: HTML, fig1.png, fig2.svg
-        with patch(
-            "src.tools.arxiv.requests.get",
-            side_effect=[html_response, png_response, svg_response],
-        ):
-            paper = fetch_arxiv_paper("https://arxiv.org/abs/2301.00001")
-
-        assert paper.kind == "html"
-        # Both images downloaded
-        assert len(paper.images) == 2
-        for p in paper.images:
-            assert p.is_file()
-            assert p.parent.name == "html_images"
-        # The HTML's src has been rewritten to local paths
-        assert 'src="images/fig1.png"' in paper.content
-        assert 'src="images/fig2.svg"' in paper.content
-        # Original absolute URLs are gone
-        assert "extracted/fig1.png" not in paper.content
-
-    def test_html_image_download_failure_falls_back_to_absolute_url(self) -> None:
-        """A failed image download should not abort the pipeline."""
-        html_body = b'<html><body><img src="extracted/missing.png" alt="x"></body></html>'
-        html_response = _mock_response(content=html_body, content_type="text/html")
-
-        # First call: HTML succeeds. Second call: image download fails.
-        def _side_effect(*_args: object, **_kwargs: object) -> object:
-            if _side_effect.calls == 0:  # type: ignore[attr-defined]
-                _side_effect.calls += 1  # type: ignore[attr-defined]
-                return html_response
-            raise requests.ConnectionError("download failed")
-
-        _side_effect.calls = 0  # type: ignore[attr-defined]
-
-        with patch("src.tools.arxiv.requests.get", side_effect=_side_effect):
-            paper = fetch_arxiv_paper("https://arxiv.org/abs/2301.00001")
-
-        # No images downloaded
-        assert paper.images == []
-        # The img src falls back to the absolute URL — readers with internet
-        # still see something rather than a broken local path. The base URL
-        # is the page URL (.../2301.00001), so urljoin gives parent /html/.
-        assert "https://arxiv.org/html/extracted/missing.png" in paper.content
-
-    def test_falls_back_to_tex_when_html_missing(self) -> None:
-        """A 404 from the HTML endpoint causes fallback to the TeX e-print."""
-        # First call: HTML returns 404. Second call: TeX e-print succeeds.
+    def test_tex_archive_is_extracted(self) -> None:
+        """A multi-file ``.tar.gz`` e-print should produce kind="tex" content."""
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            tex_data = (
-                r"\documentclass{article}\begin{document}Hello\end{document}".encode()
-            )
+            tex_data = rb"\documentclass{article}\begin{document}Hello\end{document}"
             info = tarfile.TarInfo(name="paper.tex")
             info.size = len(tex_data)
             tar.addfile(info, io.BytesIO(tex_data))
         tar_bytes = buf.getvalue()
 
-        html_404 = _mock_response(status=404, content_type="text/html")
         tex_response = _mock_response(content=tar_bytes, content_type="application/gzip")
 
-        with patch("src.tools.arxiv.requests.get", side_effect=[html_404, tex_response]):
+        with patch("src.tools.arxiv.requests.get", return_value=tex_response) as mocked:
             paper = fetch_arxiv_paper("https://arxiv.org/abs/2301.00001")
 
+        assert isinstance(paper, PaperSource)
         assert paper.kind == "tex"
         assert r"\documentclass" in paper.content
+        # No HTML probe, just the TeX e-print fetch.
+        assert mocked.call_count == 1
 
     def test_single_tex_file_response(self) -> None:
         """A text/plain e-print (single-file submission) should work as TeX."""
         tex_data = r"\documentclass{article}\begin{document}Single\end{document}"
-        html_404 = _mock_response(status=404)
         tex_response = _mock_response(content=tex_data.encode(), content_type="text/plain")
 
-        with patch("src.tools.arxiv.requests.get", side_effect=[html_404, tex_response]):
+        with patch("src.tools.arxiv.requests.get", return_value=tex_response):
             paper = fetch_arxiv_paper("2301.00001")
 
         assert paper.kind == "tex"
@@ -364,11 +289,10 @@ class TestFetchArxivPaper:
 
     def test_pdf_only_paper_raises(self) -> None:
         """A PDF-typed e-print response should raise PdfOnlyPaperError."""
-        html_404 = _mock_response(status=404)
         pdf_response = _mock_response(content=b"%PDF-1.5\n", content_type="application/pdf")
 
         with (
-            patch("src.tools.arxiv.requests.get", side_effect=[html_404, pdf_response]),
+            patch("src.tools.arxiv.requests.get", return_value=pdf_response),
             pytest.raises(PdfOnlyPaperError, match="PDF"),
         ):
             fetch_arxiv_paper("2301.00001")

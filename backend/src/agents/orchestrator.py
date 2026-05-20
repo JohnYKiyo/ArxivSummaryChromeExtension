@@ -30,7 +30,6 @@ from src.agents.translation import create_translation_agent
 from src.config import get_settings
 from src.models.job import JobStatus
 from src.tools.arxiv import PdfOnlyPaperError, fetch_arxiv_paper
-from src.tools.html_to_markdown import html_to_markdown
 from src.tools.packaging import create_zip_package, upload_to_s3
 from src.tools.tex_to_markdown import tex_to_markdown
 
@@ -199,7 +198,7 @@ async def run_pipeline(
     }
 
     try:
-        # ---- Stage 0: Fetch source (HTML preferred, TeX fallback) ----
+        # ---- Stage 0: Fetch source (TeX e-print) ----
         await _publish_progress(job_manager, job_id, 0)
 
         # Fetch directly — no LLM needed for downloading/extracting files.
@@ -207,17 +206,16 @@ async def run_pipeline(
         work_dir = paper.work_dir
 
         # ---- Stage 1: Source -> Markdown (deterministic, no LLM) ----
+        # TeX source via pandoc — handles structure, math, citations, figures.
+        # ``\input`` / ``\include`` were already expanded upstream, so the
+        # input is a single self-contained document. The HTML path
+        # (LaTeXML → markdownify) was disabled after observing that its
+        # output frequently leaked LaTeX preamble commands, inlined
+        # ``\thanks`` blocks into titles, and wrapped emails as broken
+        # relative URLs — see arxiv.fetch_arxiv_paper docstring.
         await _publish_progress(job_manager, job_id, 1)
-        if paper.kind == "html":
-            base_url = f"https://arxiv.org/html/{paper.arxiv_id}/"
-            markdown_en = html_to_markdown(paper.content, base_url=base_url)
-            logger.info("HTML → Markdown via markdownify (%d chars)", len(markdown_en))
-        else:
-            # TeX source — pandoc handles structure, math, citations, figures.
-            # \input / \include were already expanded upstream, so the input
-            # is a single self-contained document.
-            markdown_en = tex_to_markdown(paper.content, work_dir=paper.work_dir)
-            logger.info("TeX → Markdown via pandoc (%d chars)", len(markdown_en))
+        markdown_en = tex_to_markdown(paper.content, work_dir=paper.work_dir)
+        logger.info("TeX → Markdown via pandoc (%d chars)", len(markdown_en))
         results["markdown_en"] = markdown_en
 
         # ---- Stage 2: Translation ----
