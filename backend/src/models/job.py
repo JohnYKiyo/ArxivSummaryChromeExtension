@@ -19,9 +19,7 @@ class JobStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
-TERMINAL_STATUSES: frozenset[JobStatus] = frozenset(
-    {JobStatus.COMPLETED, JobStatus.ERROR, JobStatus.CANCELLED}
-)
+TERMINAL_STATUSES: frozenset[JobStatus] = frozenset({JobStatus.COMPLETED, JobStatus.ERROR, JobStatus.CANCELLED})
 
 
 @dataclass

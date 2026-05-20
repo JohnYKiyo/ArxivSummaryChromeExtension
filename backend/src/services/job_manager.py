@@ -240,9 +240,7 @@ class JobManager:
             self._table.update_item(
                 Key={"job_id": job_id},
                 UpdateExpression="SET cancel_requested = :true, updated_at = :now",
-                ConditionExpression=(
-                    "#s <> :completed AND #s <> :error AND #s <> :cancelled"
-                ),
+                ConditionExpression=("#s <> :completed AND #s <> :error AND #s <> :cancelled"),
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={
                     ":true": True,
