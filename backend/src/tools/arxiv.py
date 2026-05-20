@@ -482,6 +482,36 @@ def _strip_command(tex: str, command: str) -> str:
     return "".join(out)
 
 
+def _strip_two_arg_command(tex: str, command: str) -> str:
+    """Remove every ``\\command{X}{Y}`` from *tex* (non-nested arguments).
+
+    The ICML template uses two-argument helpers like ``\\icmlauthor{Name}{aff}``
+    and ``\\icmlaffiliation{key}{Institution}``. The single-argument
+    :func:`_strip_command` would leave the second brace pair orphaned.
+    """
+    pattern = re.compile(
+        r"\\" + re.escape(command) + r"\s*\{[^{}]*\}\s*\{[^{}]*\}"
+    )
+    return pattern.sub("", tex)
+
+
+_ICML_AUTHOR_RE = re.compile(r"\\icmlauthor\s*\{([^{}]+)\}\s*\{[^{}]*\}")
+
+
+def _icml_authors_joined(tex: str) -> str | None:
+    """Join names from every ``\\icmlauthor{Name}{aff}`` with ``\\and``.
+
+    Returns ``None`` if no ``\\icmlauthor`` appears. The result is fed
+    through :func:`_clean_author_list`, which already handles the
+    ``\\and`` separator, so downstream callers see the same author list
+    shape as the standard ``\\author`` path.
+    """
+    names = [m.group(1).strip() for m in _ICML_AUTHOR_RE.finditer(tex)]
+    if not names:
+        return None
+    return r" \and ".join(names)
+
+
 def _find_environment_body(tex: str, env: str) -> str | None:
     """Return the body of the first ``\\begin{env}...\\end{env}`` block, or ``None``."""
     begin = re.search(r"\\begin\{" + re.escape(env) + r"\}", tex)
@@ -525,20 +555,25 @@ def _extract_metadata_and_rewrite(tex: str) -> str:
     we substitute the title-block machinery with plain ``\\section*`` blocks
     that pandoc will emit as Markdown headings.
 
-    Behaviour:
-      - ``\\title{...}`` → ``\\section*{title-content}`` (replacing ``\\maketitle``,
-        or inserted right after ``\\begin{document}`` if no ``\\maketitle`` is present).
-      - ``\\author{...}`` → ``\\textit{authors}`` where ``\\and`` / ``\\\\``
-        become commas and ``\\thanks{...}`` is stripped.
-      - ``\\begin{abstract}...\\end{abstract}`` → ``\\section*{Abstract}`` followed
-        by the original body.
+    Recognises the standard LaTeX shape and the ICML conference template:
 
-    Missing pieces are skipped silently (no-op if neither title nor abstract
-    is found). Math and inline commands inside title / abstract stay in TeX
-    form so pandoc renders them on the subsequent conversion pass.
+      - Title: ``\\title{...}``  or  ``\\icmltitle{...}``
+      - Authors: ``\\author{...}``  or  one-or-more ``\\icmlauthor{Name}{aff}``
+      - Abstract: ``\\begin{abstract}...\\end{abstract}``
+
+    Behaviour:
+      - title → ``\\section*{title-content}`` (replacing ``\\maketitle``,
+        or inserted right after ``\\begin{document}`` if no ``\\maketitle``).
+      - authors → ``\\textit{authors}`` where ``\\and`` / ``\\\\`` become
+        commas and ``\\thanks{...}`` is stripped.
+      - abstract body → preceded by ``\\section*{Abstract}``.
+
+    Missing pieces are skipped silently. Math and inline commands inside
+    title / abstract stay in TeX form so pandoc renders them on the
+    subsequent conversion pass.
     """
-    title_inner = _find_command_inner(tex, "title")
-    author_inner = _find_command_inner(tex, "author")
+    title_inner = _find_command_inner(tex, "title") or _find_command_inner(tex, "icmltitle")
+    author_inner = _find_command_inner(tex, "author") or _icml_authors_joined(tex)
     abstract_body = _find_environment_body(tex, "abstract")
 
     if title_inner is None and abstract_body is None:
@@ -556,10 +591,23 @@ def _extract_metadata_and_rewrite(tex: str) -> str:
 
     title_block = "\n\n".join(block_parts) + "\n"
 
-    # Remove the originals so they don't render twice.
+    # Remove the originals so they don't render twice (and so pandoc
+    # doesn't emit raw_tex noise for the ICML-specific helpers).
     result = _strip_command(tex, "title")
+    result = _strip_command(result, "icmltitle")
+    result = _strip_command(result, "icmltitlerunning")
+    result = _strip_command(result, "icmlkeywords")
     result = _strip_command(result, "author")
     result = _strip_environment(result, "abstract")
+    # ICML's two-argument helpers — pandoc/-raw_tex drops them but stripping
+    # explicitly keeps the input pandoc sees clean.
+    for two_arg_cmd in (
+        "icmlauthor",
+        "icmlaffiliation",
+        "icmlcorrespondingauthor",
+        "icmlsetsymbol",
+    ):
+        result = _strip_two_arg_command(result, two_arg_cmd)
 
     # Replace only ``\maketitle`` invocations, not occurrences inside
     # ``\renewcommand{\maketitle}{...}`` (where ``\maketitle`` is followed

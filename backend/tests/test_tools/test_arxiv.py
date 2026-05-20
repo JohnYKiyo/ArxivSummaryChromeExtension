@@ -154,6 +154,49 @@ def test_extract_metadata_does_not_replace_renewcommand_arg() -> None:
     assert r"\renewcommand{\section*" not in out
 
 
+def test_extract_metadata_icml_template_recognised() -> None:
+    """ICML 2022+ template uses ``\\icmltitle`` and multiple ``\\icmlauthor``
+    invocations instead of the standard ``\\title`` / ``\\author``. Both must
+    be picked up so the output paper has proper title and author lines.
+    """
+    tex = "\n".join(
+        [
+            r"\documentclass{article}",
+            r"\icmltitlerunning{Rethinking the Role of LLMs in Time Series Forecasting}",
+            r"\icmltitle{Rethinking the Role of LLMs in Time Series Forecasting}",
+            r"\icmlsetsymbol{equal}{*}",
+            r"\icmlauthor{Xin Qiu}{yyy,zju}",
+            r"\icmlauthor{Junlong Tong}{yyy}",
+            r"\icmlauthor{Yirong Sun}{yyy}",
+            r"\icmlaffiliation{yyy}{Eastern Institute of Technology}",
+            r"\icmlaffiliation{zju}{Zhejiang University}",
+            r"\icmlcorrespondingauthor{Xiaoyu Shen}{xyshen@eitech.edu.cn}",
+            r"\icmlkeywords{Machine Learning, ICML}",
+            r"\begin{document}",
+            r"\begin{abstract}Abstract body.\end{abstract}",
+            r"Body of paper.",
+            r"\end{document}",
+        ]
+    )
+    out = _extract_metadata_and_rewrite(tex)
+    # Title appears once as section header.
+    assert r"\section*{Rethinking the Role of LLMs in Time Series Forecasting}" in out
+    # All three authors collected, in source order, with commas.
+    assert r"\textit{Xin Qiu, Junlong Tong, Yirong Sun}" in out
+    # Abstract preserved as \section*.
+    assert r"\section*{Abstract}" in out
+    assert "Abstract body." in out
+    # ICML-only helpers stripped from the output (they would otherwise
+    # surface as raw_tex noise downstream).
+    assert r"\icmlauthor" not in out
+    assert r"\icmlaffiliation" not in out
+    assert r"\icmlcorrespondingauthor" not in out
+    assert r"\icmlsetsymbol" not in out
+    assert r"\icmltitle" not in out
+    assert r"\icmltitlerunning" not in out
+    assert r"\icmlkeywords" not in out
+
+
 def test_extract_metadata_does_not_match_longer_command_names() -> None:
     """``\\maketitlefigure`` (a different command) must not be mistaken for
     ``\\maketitle``."""
