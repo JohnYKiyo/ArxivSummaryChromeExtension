@@ -128,6 +128,20 @@ class PandocConversionError(RuntimeError):
 # family (``\cite``, ``\citep``, ``\citet``, ``\citeyear`` etc.).
 _CITE_FAMILY = re.compile(r"\\(cite[a-zA-Z]*)(\[[^\]]*\])*\s*\{([^{}]*)\}")
 
+# TeX low-level spacing commands. Custom-typeset papers (e.g. ones with
+# redefined ``\preauthor`` / ``\maketitlehookX`` / hand-rolled keyword
+# blocks) sprinkle these throughout — and after we strip the abstract
+# environment they sometimes end up as bare ``\vskip 3em`` lines in the
+# document body, which pandoc's LaTeX reader rejects with
+# ``unexpected \vskip`` (exit 64). They are purely typographic, so
+# dropping them does not change semantic content.
+_TEX_SKIP_LENGTH = re.compile(
+    r"\\(?:vskip|hskip|kern|lineskip)"
+    r"(?:\s+-?\d+(?:\.\d+)?\s*[A-Za-z]+)?"
+)
+_TEX_SPACE_BRACED = re.compile(r"\\(?:vspace|hspace)\*?\s*\{[^{}]*\}")
+_TEX_SKIP_BARE = re.compile(r"\\(?:smallskip|medskip|bigskip|noindent|hfill|hfil|vfill|vfil)\b")
+
 _PANDOC_FROM = "latex"
 # Disabled table extensions: pandoc otherwise picks ``simple_tables`` for
 # header-less tables or ``multiline_tables`` for wide cells — neither is
@@ -192,6 +206,7 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
         work_dir = Path(tempfile.mkdtemp(prefix="pandoc_"))
 
     tex_content = _normalise_cite_args(tex_content)
+    tex_content = _strip_tex_spacing_commands(tex_content)
 
     tex_path = work_dir / "_pandoc_input.tex"
     tex_path.write_text(tex_content, encoding="utf-8")
@@ -228,6 +243,32 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
 
     logger.info("pandoc converted %d chars TeX → %d chars Markdown", len(tex_content), len(markdown))
     return markdown
+
+
+def _strip_tex_spacing_commands(tex: str) -> str:
+    """Strip low-level TeX spacing commands that pandoc rejects in body context.
+
+    Custom-typeset arXiv papers commonly use ``\\vskip 3em``, ``\\hskip``,
+    ``\\vspace{2em}`` etc. for visual layout. After we remove the
+    ``\\begin{abstract}...\\end{abstract}`` environment as part of
+    metadata rewriting, any ``\\vskip`` lines that surrounded the
+    abstract end up exposed at the top level of the document body.
+    pandoc's LaTeX reader then errors out (exit 64,
+    ``unexpected \\vskip``). These commands are purely typographic, so
+    removing them is safe.
+
+    Covers:
+      - ``\\vskip <length>`` / ``\\hskip`` / ``\\kern`` / ``\\lineskip``
+        (unbraced length argument like ``3em``)
+      - ``\\vspace{<length>}`` / ``\\hspace{<length>}`` (braced argument,
+        with optional ``*`` modifier)
+      - ``\\smallskip`` / ``\\medskip`` / ``\\bigskip``,
+        ``\\noindent``, ``\\hfill`` / ``\\vfill`` (no argument)
+    """
+    tex = _TEX_SKIP_LENGTH.sub("", tex)
+    tex = _TEX_SPACE_BRACED.sub("", tex)
+    tex = _TEX_SKIP_BARE.sub("", tex)
+    return tex
 
 
 def _normalise_cite_args(tex: str) -> str:

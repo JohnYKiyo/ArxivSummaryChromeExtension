@@ -201,6 +201,73 @@ def test_citation_at_sign_stripped_in_multi_key_citation(tmp_path: Path) -> None
     assert "b" in md
 
 
+def test_strip_vskip_length_command() -> None:
+    """``\\vskip 3em`` (and friends) must be removed before pandoc sees them."""
+    from src.tools.tex_to_markdown import _strip_tex_spacing_commands
+
+    tex = "Body.\n\\vskip 3em\n\\hskip 1in\n\\kern 0.5pt\nMore body."
+    out = _strip_tex_spacing_commands(tex)
+    assert "\\vskip" not in out
+    assert "\\hskip" not in out
+    assert "\\kern" not in out
+    assert "Body." in out
+    assert "More body." in out
+
+
+def test_strip_braced_spacing_command() -> None:
+    """``\\vspace{2em}`` / ``\\hspace*{1cm}`` braced forms also removed."""
+    from src.tools.tex_to_markdown import _strip_tex_spacing_commands
+
+    tex = "X \\vspace{2em} Y \\hspace*{1cm} Z"
+    out = _strip_tex_spacing_commands(tex)
+    assert "\\vspace" not in out
+    assert "\\hspace" not in out
+    assert "X" in out
+    assert "Y" in out
+    assert "Z" in out
+
+
+def test_strip_bare_spacing_command() -> None:
+    """Argumentless ``\\smallskip``, ``\\noindent``, ``\\hfill`` etc. removed."""
+    from src.tools.tex_to_markdown import _strip_tex_spacing_commands
+
+    tex = "A \\smallskip B \\noindent C \\hfill D \\bigskip E"
+    out = _strip_tex_spacing_commands(tex)
+    for cmd in ("\\smallskip", "\\noindent", "\\hfill", "\\bigskip"):
+        assert cmd not in out
+
+
+def test_strip_does_not_touch_unrelated_commands() -> None:
+    from src.tools.tex_to_markdown import _strip_tex_spacing_commands
+
+    tex = r"\section{Header} \emph{italic} \textbf{bold}"
+    assert _strip_tex_spacing_commands(tex) == tex
+
+
+def test_vskip_in_body_does_not_crash_pandoc(tmp_path: Path) -> None:
+    """A bare ``\\vskip 3em`` in document body must not abort pandoc.
+
+    Custom-typeset arXiv papers place ``\\vskip`` next to environments
+    (e.g. after ``\\end{abstract}``). When upstream metadata rewriting
+    strips the surrounding environment, the ``\\vskip`` ends up at body
+    top-level and pandoc's LaTeX reader was rejecting it (exit 64,
+    ``unexpected \\vskip``). The preprocessor strips these.
+    """
+    tex = "\n".join(
+        [
+            r"\documentclass{article}",
+            r"\begin{document}",
+            r"\vskip 3em",
+            r"\section{Intro}",
+            r"Body of paper.",
+            r"\end{document}",
+        ]
+    )
+    md = tex_to_markdown(tex, work_dir=tmp_path)
+    assert "Body of paper." in md
+    assert "\\vskip" not in md
+
+
 def test_cite_with_leading_comma_normalised(tmp_path: Path) -> None:
     """``\\cite{,Key}`` (author typo) must not break the pandoc pipeline.
 
