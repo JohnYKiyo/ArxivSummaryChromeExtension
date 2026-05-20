@@ -51,6 +51,14 @@ STAGES = [
 ]
 
 
+class JobCancelledError(Exception):
+    """Raised when the orchestrator observes ``cancel_requested`` between stages.
+
+    Caught at the top of :func:`run_pipeline` to transition the job to the
+    CANCELLED terminal state without surfacing as a generic pipeline failure.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Pipeline execution with DynamoDB progress
 # ---------------------------------------------------------------------------
@@ -164,6 +172,18 @@ async def _publish_progress(
     logger.info("Pipeline [%s] stage=%s progress=%d%%", job_id, stage["name"], stage["progress"])
 
 
+async def _check_cancelled(job_manager: JobManager | None, job_id: str) -> None:
+    """Abort the pipeline if the API has requested cancellation.
+
+    Polled at each stage boundary. We can't interrupt an in-flight LLM stream,
+    so cancellation latency is at most one stage — but never mid-stage.
+    """
+    if job_manager is None:
+        return
+    if await job_manager.is_cancel_requested(job_id):
+        raise JobCancelledError
+
+
 async def run_pipeline(
     arxiv_url: str,
     job_id: str,
@@ -204,6 +224,7 @@ async def run_pipeline(
 
     try:
         # ---- Stage 0: Fetch source (TeX e-print) ----
+        await _check_cancelled(job_manager, job_id)
         await _publish_progress(job_manager, job_id, 0)
 
         # Fetch directly — no LLM needed for downloading/extracting files.
@@ -218,12 +239,14 @@ async def run_pipeline(
         # output frequently leaked LaTeX preamble commands, inlined
         # ``\thanks`` blocks into titles, and wrapped emails as broken
         # relative URLs — see arxiv.fetch_arxiv_paper docstring.
+        await _check_cancelled(job_manager, job_id)
         await _publish_progress(job_manager, job_id, 1)
         markdown_en = tex_to_markdown(paper.content, work_dir=paper.work_dir)
         logger.info("TeX → Markdown via pandoc (%d chars)", len(markdown_en))
         results["markdown_en"] = markdown_en
 
         # ---- Stage 2: Translation ----
+        await _check_cancelled(job_manager, job_id)
         await _publish_progress(job_manager, job_id, 2)
         translation_agent = create_translation_agent(model, api_key=api_key)
         markdown_ja = await _run_single_agent(
@@ -233,6 +256,7 @@ async def run_pipeline(
         results["markdown_ja"] = markdown_ja
 
         # ---- Stage 3: Summary ----
+        await _check_cancelled(job_manager, job_id)
         await _publish_progress(job_manager, job_id, 3)
         summary_agent = create_summary_agent(model, api_key=api_key)
         summary_ja = await _run_single_agent(
@@ -242,6 +266,7 @@ async def run_pipeline(
         results["summary_ja"] = summary_ja
 
         # ---- Stage 4: Packaging ----
+        await _check_cancelled(job_manager, job_id)
         await _publish_progress(job_manager, job_id, 4)
         zip_path = create_zip_package(
             paper_en_md=markdown_en,
@@ -272,6 +297,16 @@ async def run_pipeline(
             await job_manager.set_result(job_id, download_url, local_result_path=local_path)
 
         logger.info("Pipeline [%s] completed successfully", job_id)
+
+    except JobCancelledError:
+        # User-initiated cancellation. The cancel_requested flag was set
+        # via POST /jobs/{id}/cancel; we observed it at a stage boundary.
+        # Transition to the terminal CANCELLED status — this is an expected
+        # flow, not an error, so don't re-raise.
+        logger.info("Pipeline [%s] cancelled by user", job_id)
+        if job_manager is not None:
+            await job_manager.set_cancelled(job_id)
+        return results
 
     except PdfOnlyPaperError as exc:
         # Friendly, actionable message for the common "only-PDF" case.

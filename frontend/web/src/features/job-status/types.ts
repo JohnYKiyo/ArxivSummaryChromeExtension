@@ -27,6 +27,7 @@ export interface JobState {
   progress: number;
   isComplete: boolean;
   isError: boolean;
+  isCancelled: boolean;
   errorMessage: string | null;
   downloadUrl: string | null;
 }

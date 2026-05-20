@@ -3,6 +3,7 @@
 Defines the following endpoints:
 - POST /api/v1/convert - Create a new conversion job
 - GET /api/v1/jobs/{job_id}/status - Poll job progress
+- POST /api/v1/jobs/{job_id}/cancel - Request cancellation of a running job
 - GET /api/v1/jobs/{job_id}/download - Download the ZIP (local dev only)
 - GET /api/v1/health - Health check
 
@@ -22,6 +23,7 @@ from fastapi.responses import FileResponse
 from src.api.auth import get_current_user
 from src.config import get_settings
 from src.models.api import ConvertRequest, ConvertResponse, ErrorResponse, HealthResponse, StatusResponse
+from src.models.job import TERMINAL_STATUSES
 from src.services.job_manager import JobManager
 from src.services.pipeline_dispatcher import PipelineDispatcher
 
@@ -137,6 +139,56 @@ async def get_job_status(
         current_step=job.current_step,
         progress=job.progress,
         message=job.message,
+        error=job.error,
+        download_url=job.download_url,
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/cancel",
+    response_model=StatusResponse,
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
+async def cancel_job(
+    job_id: str,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> StatusResponse:
+    """Request cooperative cancellation of a running conversion job.
+
+    Sets the ``cancel_requested`` flag in DynamoDB. The pipeline polls this
+    between stages and transitions to CANCELLED on the next checkpoint, so
+    cancellation is observed within at most one stage (typically seconds for
+    fetch/markdown, up to minutes if an LLM call is in flight).
+
+    Returns 409 if the job is already in a terminal state (completed / error /
+    cancelled) — cancellation is a no-op for finished jobs.
+    """
+    job_manager = _get_job_manager()
+
+    job = await job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job not found: {job_id}",
+        )
+
+    if job.status in TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job {job_id} is already finished ({job.status.value}); cannot cancel.",
+        )
+
+    await job_manager.request_cancel(job_id)
+
+    # Return the latest snapshot with an interim message. Status is still
+    # the in-flight stage at this point — the pipeline flips it to CANCELLED
+    # at the next checkpoint, and the polling client picks that up.
+    return StatusResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        current_step=job.current_step,
+        progress=job.progress,
+        message="キャンセルを受け付けました",
         error=job.error,
         download_url=job.download_url,
     )

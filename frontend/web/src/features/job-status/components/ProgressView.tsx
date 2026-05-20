@@ -11,7 +11,10 @@ interface ProgressViewProps {
   currentStep: StepName | null;
   progress: number;
   isError: boolean;
+  isCancelled: boolean;
   errorMessage: string | null;
+  onCancel?: () => void;
+  cancelDisabled?: boolean;
 }
 
 interface StepDefinition {
@@ -109,9 +112,19 @@ export default function ProgressView({
   currentStep,
   progress,
   isError,
+  isCancelled,
   errorMessage,
+  onCancel,
+  cancelDisabled,
 }: ProgressViewProps) {
-  const isComplete = progress >= 100 && !isError;
+  const isComplete = progress >= 100 && !isError && !isCancelled;
+  // The cancel button is only meaningful while work is actually in flight.
+  // Terminal states (error / cancelled / done) hide it — the caller's reset
+  // button takes over.
+  const showCancel = !isError && !isCancelled && !isComplete && onCancel;
+  // After the user clicks cancel we keep the button visible but disabled
+  // so they get visual confirmation that the request is in flight; the
+  // pipeline may still be mid-LLM and take a moment to acknowledge.
 
   return (
     <div className="w-full max-w-2xl mx-auto space-y-6">
@@ -126,9 +139,11 @@ export default function ProgressView({
             className={`h-full rounded-full transition-all duration-500 ease-out ${
               isError
                 ? "bg-red-500"
-                : isComplete
-                  ? "bg-green-500"
-                  : "bg-blue-500"
+                : isCancelled
+                  ? "bg-gray-400"
+                  : isComplete
+                    ? "bg-green-500"
+                    : "bg-blue-500"
             }`}
             style={{ width: `${Math.min(progress, 100)}%` }}
           />
@@ -145,6 +160,28 @@ export default function ProgressView({
           />
         ))}
       </div>
+
+      {/* Cancel button */}
+      {showCancel && (
+        <div className="text-center">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={cancelDisabled}
+            className="px-6 py-2 border border-gray-300 text-gray-700 font-medium rounded-lg text-sm hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-gray-400 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {cancelDisabled ? "キャンセル中..." : "キャンセル"}
+          </button>
+        </div>
+      )}
+
+      {/* Cancelled display */}
+      {isCancelled && (
+        <div className="bg-gray-50 border border-gray-200 rounded-lg p-4 text-sm text-gray-700">
+          <p className="font-medium">キャンセルされました</p>
+          <p className="mt-1">{errorMessage ?? "処理がキャンセルされました"}</p>
+        </div>
+      )}
 
       {/* Error display */}
       {isError && errorMessage && (

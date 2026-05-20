@@ -118,7 +118,11 @@ class InProcessPipelineDispatcher:
         except Exception:
             logger.exception("Pipeline task failed for job %s", job_id)
             job = await self._job_manager.get_job(job_id)
-            if job and job.status != "error":
+            # Don't clobber a terminal status (cancelled/completed/error)
+            # with a generic "Pipeline execution failed" message.
+            from src.models.job import TERMINAL_STATUSES
+
+            if job and job.status not in TERMINAL_STATUSES:
                 await self._job_manager.set_error(job_id, "Pipeline execution failed")
 
 
