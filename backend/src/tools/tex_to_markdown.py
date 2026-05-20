@@ -207,6 +207,7 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
 
     tex_content = _normalise_cite_args(tex_content)
     tex_content = _strip_tex_spacing_commands(tex_content)
+    tex_content = _unwrap_brace_swallowers(tex_content)
 
     tex_path = work_dir / "_pandoc_input.tex"
     tex_path.write_text(tex_content, encoding="utf-8")
@@ -243,6 +244,101 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
 
     logger.info("pandoc converted %d chars TeX → %d chars Markdown", len(tex_content), len(markdown))
     return markdown
+
+
+# Quarto-origin TeX habitually decorates each figure with two pandoc-hostile
+# patterns that silently swallow the wrapped ``\includegraphics``:
+#
+#   1. ``\pandocbounded{\includegraphics{...}}`` — pandoc-LaTeX's image
+#      sizing helper. The preamble defines it with TeX internals (``\sbox``,
+#      ``\Gscale@div``, ``\dimexpr``) that pandoc's LaTeX *reader* cannot
+#      evaluate, so the expansion yields nothing and the inner image is lost.
+#   2. ``\centering{...}`` inside ``\begin{figure}`` — Quarto's LaTeX writer
+#      uses brace-grouped form, but ``\centering`` is a *declaration*, not a
+#      command. Standard LaTeX would tolerate ``\centering`` followed by a
+#      ``{...}`` group, but pandoc treats ``\centering{...}`` as a command
+#      that consumes its braced argument and emits nothing.
+#
+# Both patterns share the same shape — command name immediately followed by
+# ``{`` — and the same fix: unwrap to the inner content, brace-balanced so
+# nested arguments like ``\includegraphics[opts]{path}`` survive.
+_BRACE_SWALLOWERS: tuple[str, ...] = (
+    r"\pandocbounded",
+    r"\centering",
+    r"\raggedright",
+    r"\raggedleft",
+)
+
+
+def _unwrap_brace_swallowers(tex: str) -> str:
+    r"""Unwrap brace-grouped declarations that pandoc would otherwise eat.
+
+    Targets ``\pandocbounded{X}``, ``\centering{X}``, ``\raggedright{X}`` and
+    ``\raggedleft{X}`` — all common in Quarto-generated arXiv sources
+    (e.g. 2508.15817). In every case the same failure mode applies: pandoc's
+    LaTeX reader treats the command as consuming its braced argument and
+    silently drops ``X``, so the wrapped ``\includegraphics`` vanishes and
+    the rendered Markdown has ``<figure>`` + ``<figcaption>`` but no
+    ``<img>``. After unwrapping, the bare ``\centering``/``\raggedright``
+    declarations are no longer present — that's fine, pandoc ignores them
+    in figure environments anyway, since alignment isn't expressible in
+    Markdown.
+
+    Brace-balanced: ``\pandocbounded{\includegraphics[w=1\linewidth]{path}}``
+    unwraps without breaking on the inner ``{path}`` brace. Backslash
+    escapes (``\{``, ``\}``, plus any ``\X``) are skipped so they don't
+    mis-count depth.
+
+    Bare declarations like ``\centering\n\includegraphics{...}`` (no
+    following ``{``) are left alone — they are already valid LaTeX and
+    pandoc handles them correctly.
+    """
+    if not any(name + "{" in tex for name in _BRACE_SWALLOWERS):
+        return tex
+    out: list[str] = []
+    i = 0
+    n = len(tex)
+    while i < n:
+        next_idx = -1
+        next_name = ""
+        for name in _BRACE_SWALLOWERS:
+            needle = name + "{"
+            hit = tex.find(needle, i)
+            if hit >= 0 and (next_idx < 0 or hit < next_idx):
+                next_idx = hit
+                next_name = needle
+        if next_idx < 0:
+            out.append(tex[i:])
+            break
+        out.append(tex[i:next_idx])
+        j = next_idx + len(next_name)
+        depth = 1
+        inner_start = j
+        while j < n and depth > 0:
+            ch = tex[j]
+            if ch == "\\" and j + 1 < n:
+                j += 2  # skip ``\{`` / ``\}`` and other backslash escapes
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth == 0:
+            # The captured inner content may itself contain another swallower
+            # — e.g. ``\centering{\pandocbounded{\includegraphics{...}}}`` in
+            # Quarto-origin sources. Recurse so every layer is unwrapped, not
+            # just the outermost.
+            out.append(_unwrap_brace_swallowers(tex[inner_start:j]))
+            i = j + 1
+        else:
+            # Unbalanced braces — leave the rest untouched rather than corrupt
+            # the document. Pandoc will surface the real syntax error.
+            out.append(tex[next_idx:])
+            break
+    return "".join(out)
 
 
 def _strip_tex_spacing_commands(tex: str) -> str:

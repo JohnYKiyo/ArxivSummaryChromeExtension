@@ -107,6 +107,197 @@ def test_includegraphics_becomes_image_link(tmp_path: Path) -> None:
     assert "images/fig1.png" in md
 
 
+def test_pandocbounded_wrapper_unwrapped_so_image_survives(tmp_path: Path) -> None:
+    r"""``\pandocbounded{\includegraphics{...}}`` must still produce an ``<img>``.
+
+    Quarto-origin arXiv papers (e.g. 2508.15817) wrap every figure in
+    ``\pandocbounded``, defined in the preamble with TeX internals
+    (``\sbox``, ``\Gscale@div``) that pandoc's LaTeX reader cannot evaluate.
+    Without unwrapping, the wrapped ``\includegraphics`` silently disappears
+    and the rendered Markdown shows ``<figure>`` + ``<figcaption>`` but no
+    image — so Obsidian renders a caption with nothing above it.
+    """
+    tex = "\n".join(
+        [
+            r"\documentclass{article}",
+            r"\usepackage{graphicx}",
+            r"\makeatletter",
+            r"\newsavebox\pandoc@box",
+            r"\newcommand*\pandocbounded[1]{%",
+            r"  \sbox\pandoc@box{#1}%",
+            r"  \Gscale@div\@tempa{\textheight}{\dimexpr\ht\pandoc@box+\dp\pandoc@box\relax}%",
+            r"  \else\usebox{\pandoc@box}%",
+            r"  \fi%",
+            r"}",
+            r"\makeatother",
+            r"\begin{document}",
+            r"\begin{figure}",
+            r"\pandocbounded{\includegraphics[width=1\linewidth,keepaspectratio]{figures/overview.png}}",
+            r"\caption{\label{fig-overview}Experiment setup diagram.}",
+            r"\end{figure}",
+            r"\end{document}",
+        ]
+    )
+    md = tex_to_markdown(tex, work_dir=tmp_path)
+    assert "images/overview.png" in md, (
+        "Expected the unwrapped \\includegraphics to land at images/overview.png; "
+        f"got:\n{md}"
+    )
+
+
+def test_unwrap_brace_swallowers_balances_nested_braces() -> None:
+    """The unwrap step must track brace depth, not split on the first ``}``.
+
+    ``\\includegraphics[opt]{path}`` contains a brace-pair inside the
+    ``\\pandocbounded{...}`` argument; a naive replace would stop at the
+    inner ``}`` and leave a dangling ``}`` in the output.
+    """
+    from src.tools.tex_to_markdown import _unwrap_brace_swallowers
+
+    tex = r"prefix \pandocbounded{\includegraphics[width=1\linewidth]{path/img.png}} suffix"
+    result = _unwrap_brace_swallowers(tex)
+    assert result == r"prefix \includegraphics[width=1\linewidth]{path/img.png} suffix"
+
+
+def test_unwrap_brace_swallowers_leaves_unrelated_tex_alone() -> None:
+    from src.tools.tex_to_markdown import _unwrap_brace_swallowers
+
+    tex = r"\section{Intro} \textbf{bold} \cite{Foo} \includegraphics{plain.png}"
+    assert _unwrap_brace_swallowers(tex) == tex
+
+
+def test_unwrap_brace_swallowers_handles_multiple_calls() -> None:
+    from src.tools.tex_to_markdown import _unwrap_brace_swallowers
+
+    tex = (
+        r"\pandocbounded{\includegraphics{a.png}}"
+        r" between "
+        r"\pandocbounded{\includegraphics[width=2cm]{b.png}}"
+    )
+    expected = r"\includegraphics{a.png} between \includegraphics[width=2cm]{b.png}"
+    assert _unwrap_brace_swallowers(tex) == expected
+
+
+def test_centering_with_braces_unwrapped_so_image_survives(tmp_path: Path) -> None:
+    r"""Quarto's ``\centering{\includegraphics{...}}`` figure shape must yield ``<img>``.
+
+    Quarto's LaTeX writer emits ``\centering`` as if it took a braced
+    argument, e.g.::
+
+        \begin{figure}
+        \centering{
+        \includegraphics[width=1\linewidth]{images/layout.png}
+        }
+        \caption{...}
+        \end{figure}
+
+    Standard LaTeX accepts this (``\centering`` is a declaration; the
+    braces just form a harmless group), but pandoc treats ``\centering{X}``
+    as a command that consumes ``X`` and emits nothing. Without unwrapping,
+    the rendered ``<figure>`` is missing its ``<img>``. This pattern
+    appears in 2508.15817 alongside ``\pandocbounded``.
+    """
+    tex = "\n".join(
+        [
+            r"\documentclass{article}",
+            r"\usepackage{graphicx}",
+            r"\begin{document}",
+            r"\begin{figure}",
+            r"\centering{",
+            r"\includegraphics[width=1\linewidth]{figures/layout.png}",
+            r"}",
+            r"\caption{\label{fig-data-types}A caption}",
+            r"\end{figure}",
+            r"\end{document}",
+        ]
+    )
+    md = tex_to_markdown(tex, work_dir=tmp_path)
+    assert "images/layout.png" in md, (
+        "Expected the unwrapped \\includegraphics to land at images/layout.png; "
+        f"got:\n{md}"
+    )
+
+
+def test_bare_centering_declaration_is_left_alone() -> None:
+    """Plain ``\\centering`` (no braces) is valid LaTeX and must not be touched."""
+    from src.tools.tex_to_markdown import _unwrap_brace_swallowers
+
+    tex = r"\begin{figure} \centering \includegraphics{ok.png} \end{figure}"
+    assert _unwrap_brace_swallowers(tex) == tex
+
+
+def test_nested_centering_inside_pandocbounded_fully_unwrapped() -> None:
+    r"""``\centering{ ... \pandocbounded{\includegraphics{...}} ... }`` must unwrap both layers.
+
+    In 2508.15817 every figure is shaped like::
+
+        \begin{figure}
+        \centering{
+        \pandocbounded{\includegraphics[...]{path}}
+        }
+        \caption{...}
+        \end{figure}
+
+    A single-pass unwrap consumes the outer ``\centering{...}`` and emits
+    the inner content (including ``\pandocbounded{...}``) without re-scanning
+    it — so the inner swallower survives and pandoc still drops the image.
+    The implementation recurses into captured content; this test would
+    regress to a half-unwrapped string if recursion is lost.
+    """
+    from src.tools.tex_to_markdown import _unwrap_brace_swallowers
+
+    tex = (
+        r"\centering{"
+        "\n"
+        r"\pandocbounded{\includegraphics[width=1\linewidth]{figs/x.png}}"
+        "\n"
+        r"}"
+    )
+    expected = "\n" + r"\includegraphics[width=1\linewidth]{figs/x.png}" + "\n"
+    assert _unwrap_brace_swallowers(tex) == expected
+
+
+def test_quarto_figure_full_pipeline_produces_img(tmp_path: Path) -> None:
+    r"""The full pandoc pipeline must emit ``<img>`` for the Quarto figure shape.
+
+    End-to-end regression for the 2508.15817 figure failure mode: outer
+    ``\centering{ ... }`` wrapping inner ``\pandocbounded{...}``. Before the
+    fix this rendered as ``<figure>`` + ``<p> </p>`` + ``<figcaption>`` — a
+    caption with nothing above it in Obsidian.
+    """
+    tex = "\n".join(
+        [
+            r"\documentclass{article}",
+            r"\usepackage{graphicx}",
+            r"\makeatletter",
+            r"\newsavebox\pandoc@box",
+            r"\newcommand*\pandocbounded[1]{%",
+            r"  \sbox\pandoc@box{#1}%",
+            r"  \else\usebox{\pandoc@box}%",
+            r"  \fi%",
+            r"}",
+            r"\makeatother",
+            r"\begin{document}",
+            r"\begin{figure}",
+            r"",
+            r"\centering{",
+            r"",
+            r"\pandocbounded{\includegraphics[keepaspectratio]{figs/overview.png}}",
+            r"",
+            r"}",
+            r"",
+            r"\caption{\label{fig-overview}Experiment setup diagram.}",
+            r"",
+            r"\end{figure}",
+            r"\end{document}",
+        ]
+    )
+    md = tex_to_markdown(tex, work_dir=tmp_path)
+    assert "images/overview.png" in md, (
+        "Expected fully-unwrapped figure to ship an image; got:\n" + md
+    )
+
+
 def test_malformed_tex_raises_conversion_error(tmp_path: Path) -> None:
     """An obviously broken TeX document should surface as PandocConversionError.
 
@@ -637,6 +828,75 @@ def test_raises_when_pandoc_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     monkeypatch.setattr("src.tools.tex_to_markdown.shutil.which", lambda _name: None)
     with pytest.raises(PandocNotInstalledError):
         tex_to_markdown(r"\documentclass{article}\begin{document}x\end{document}", work_dir=tmp_path)
+
+
+def test_commented_title_does_not_shadow_real_title(tmp_path: Path) -> None:
+    r"""``% \title{Placeholder}`` above the real ``\title{...}`` must not win.
+
+    Reproduces the 2601.11516 (Google DeepMind Probes) failure mode: their
+    ``boilerplate.tex`` ships the template placeholder commented out one
+    line above the real declaration::
+
+        % \title{Using the Google DeepMind \LaTeX ~Style}
+        \title{Building Production-Ready Probes For Gemini}
+
+    Before the fix, the metadata regex picked the *first* textual
+    ``\title{`` — i.e. the commented placeholder — and the rendered paper
+    carried the template's filler title.
+    """
+    from src.tools.arxiv import _find_command_inner
+
+    tex = "\n".join(
+        [
+            r"\documentclass{article}",
+            r"% \title{Placeholder Title}",
+            r"\title{Real Title}",
+            r"\begin{document}",
+            r"\maketitle",
+            r"\end{document}",
+        ]
+    )
+    assert _find_command_inner(tex, "title") == "Real Title"
+
+    rewritten = _extract_metadata_and_rewrite(tex)
+    md = tex_to_markdown(rewritten, work_dir=tmp_path)
+    assert "Placeholder Title" not in md, md
+    assert re.search(r"^#\s+Real Title", md, re.MULTILINE), md
+
+
+def test_commented_begin_abstract_does_not_shadow_real_abstract(tmp_path: Path) -> None:
+    r"""A commented ``% \begin{abstract}`` must not be picked up as the abstract.
+
+    Same shape as the title bug but for the abstract environment: a
+    commented-out template line shouldn't shadow the real
+    ``\begin{abstract}...\end{abstract}`` below it.
+    """
+    from src.tools.arxiv import _find_environment_body
+
+    tex = "\n".join(
+        [
+            r"% \begin{abstract} placeholder body \end{abstract}",
+            r"\begin{abstract}",
+            r"Real abstract content.",
+            r"\end{abstract}",
+        ]
+    )
+    body = _find_environment_body(tex, "abstract")
+    assert body is not None
+    assert "Real abstract content." in body
+    assert "placeholder body" not in body
+
+
+def test_escaped_percent_does_not_start_a_comment() -> None:
+    r"""``\%`` is a literal percent — must not be treated as a comment start.
+
+    Otherwise ``\title{50\% off}`` would be parsed as ``\title{50`` plus a
+    comment, and we'd extract the wrong inner.
+    """
+    from src.tools.arxiv import _find_command_inner
+
+    tex = r"\title{50\% off and more}"
+    assert _find_command_inner(tex, "title") == r"50\% off and more"
 
 
 def test_title_block_renders_after_metadata_rewrite(tmp_path: Path) -> None:
