@@ -283,6 +283,31 @@ def test_clean_author_list_collapses_whitespace_and_commas() -> None:
     assert _clean_author_list(raw) == "Alice, Bob, Charlie, Dave"
 
 
+def test_clean_author_list_drops_trailing_control_space() -> None:
+    """Lone ``\\`` followed by whitespace inside ``\\author{}`` must be dropped.
+
+    ICLR-style author blocks (e.g. arXiv 2605.05242) end every name line
+    with ``Name \\<EOL>``. The lone backslash is a TeX control space —
+    semantically a single space. If it survives our cleaner, the wrapping
+    ``\\textit{<authors>}`` ends in ``\\}`` (an escaped literal ``}``)
+    which does *not* close the ``\\textit{`` group, so pandoc reads
+    through the next paragraph break and aborts with ``unexpected ()``
+    at the following ``\\section*{Abstract}``.
+    """
+    raw = (
+        "\\vspace{-2em} \\\\\n"
+        "    \\textbf{Alice}$^{1}$ \\\n"
+        "    \\textbf{Bob}$^{2}$ \\\\\n"
+        "    $^{1}$Acme \\\n"
+        "    $^{2}$Lambda \\\n"
+    )
+    out = _clean_author_list(raw)
+    assert not out.endswith("\\"), f"trailing backslash survived: {out!r}"
+    assert "Alice" in out
+    assert "Bob" in out
+    assert "Lambda" in out
+
+
 def test_expand_inputs_inlines_bbl(tmp_path: Path) -> None:
     (tmp_path / "main.tex").write_text(
         r"Body \bibliographystyle{plain} \bibliography{refs}",
@@ -354,3 +379,77 @@ def test_expand_inputs_still_handles_plain_inputs(tmp_path: Path) -> None:
     (tmp_path / "section1.tex").write_text("Middle", encoding="utf-8")
     out = _expand_inputs((tmp_path / "main.tex").read_text(encoding="utf-8"), tmp_path)
     assert out == "Before Middle After"
+
+
+def test_expand_inputs_nested_input_resolves_from_root(tmp_path: Path) -> None:
+    """A nested ``\\input{tables/foo}`` referenced from inside ``sections/sub.tex``
+    must resolve against the main TeX's root directory, mirroring LaTeX's
+    ``TEXINPUTS`` behaviour. Without this fallback the lookup would only
+    try ``sections/tables/foo.tex`` (relative to the current file) and miss
+    the actual file at ``tables/foo.tex``.
+
+    Layout::
+
+        main.tex                 \\input{sections/sub}
+        sections/sub.tex         \\input{tables/foo}
+        tables/foo.tex           Table body
+    """
+    (tmp_path / "main.tex").write_text(
+        r"Before \input{sections/sub} After",
+        encoding="utf-8",
+    )
+    sections = tmp_path / "sections"
+    sections.mkdir()
+    (sections / "sub.tex").write_text(
+        r"Sub-start \input{tables/foo} Sub-end",
+        encoding="utf-8",
+    )
+    tables = tmp_path / "tables"
+    tables.mkdir()
+    (tables / "foo.tex").write_text("Table body", encoding="utf-8")
+
+    out = _expand_inputs(
+        (tmp_path / "main.tex").read_text(encoding="utf-8"),
+        tmp_path,
+        root_dir=tmp_path,
+    )
+
+    # The nested input is fully resolved — no \input directives remain.
+    assert r"\input" not in out
+    # All four text fragments are present in source order.
+    for fragment, follower in (
+        ("Before", "Sub-start"),
+        ("Sub-start", "Table body"),
+        ("Table body", "Sub-end"),
+        ("Sub-end", "After"),
+    ):
+        assert out.index(fragment) < out.index(follower), out
+
+
+def test_expand_inputs_prefers_current_dir_over_root(tmp_path: Path) -> None:
+    """When the same relative path resolves under both the current file's
+    directory and the root, the current-dir match wins. This matches
+    LaTeX's own resolution order and lets a chapter override a shared
+    resource by shadowing it locally.
+    """
+    (tmp_path / "main.tex").write_text(
+        r"\input{sections/sub}",
+        encoding="utf-8",
+    )
+    sections = tmp_path / "sections"
+    sections.mkdir()
+    (sections / "sub.tex").write_text(
+        r"\input{shared}",
+        encoding="utf-8",
+    )
+    # Local override in sections/, plus a root-level fallback.
+    (sections / "shared.tex").write_text("LOCAL", encoding="utf-8")
+    (tmp_path / "shared.tex").write_text("ROOT", encoding="utf-8")
+
+    out = _expand_inputs(
+        (tmp_path / "main.tex").read_text(encoding="utf-8"),
+        tmp_path,
+        root_dir=tmp_path,
+    )
+    assert "LOCAL" in out
+    assert "ROOT" not in out

@@ -138,8 +138,42 @@ class TestConvertEndpoint:
         assert data["job_id"] == "abc123"
         assert data["status"] == "accepted"
         assert data["status_url"] == "/api/v1/jobs/abc123/status"
-        # The pipeline should have been dispatched exactly once.
-        mock_dispatcher.dispatch.assert_awaited_once_with("abc123", "https://arxiv.org/abs/2301.00001")
+        # The pipeline should have been dispatched exactly once. No
+        # X-Google-Api-Key header was sent, so api_key is None (env-based
+        # auth, matching the web UI flow).
+        mock_dispatcher.dispatch.assert_awaited_once_with(
+            "abc123", "https://arxiv.org/abs/2301.00001", api_key=None
+        )
+
+    async def test_api_key_header_is_forwarded(
+        self, client: AsyncClient, mock_dispatcher: MagicMock
+    ) -> None:
+        """When the extension supplies X-Google-Api-Key the dispatcher gets it."""
+        response = await client.post(
+            "/api/v1/convert",
+            json={"arxiv_url": "https://arxiv.org/abs/2301.00001"},
+            headers={"X-Google-Api-Key": "user-supplied-key"},
+        )
+        assert response.status_code == 202
+        mock_dispatcher.dispatch.assert_awaited_once_with(
+            "abc123",
+            "https://arxiv.org/abs/2301.00001",
+            api_key="user-supplied-key",
+        )
+
+    async def test_blank_api_key_header_falls_back_to_none(
+        self, client: AsyncClient, mock_dispatcher: MagicMock
+    ) -> None:
+        """A whitespace-only header must not be forwarded as a credential."""
+        response = await client.post(
+            "/api/v1/convert",
+            json={"arxiv_url": "https://arxiv.org/abs/2301.00001"},
+            headers={"X-Google-Api-Key": "   "},
+        )
+        assert response.status_code == 202
+        mock_dispatcher.dispatch.assert_awaited_once_with(
+            "abc123", "https://arxiv.org/abs/2301.00001", api_key=None
+        )
 
     async def test_non_arxiv_url_returns_422(self, client: AsyncClient) -> None:
         response = await client.post(

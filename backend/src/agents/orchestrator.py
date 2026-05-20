@@ -168,6 +168,7 @@ async def run_pipeline(
     arxiv_url: str,
     job_id: str,
     job_manager: JobManager | None = None,
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     """Execute the full translation pipeline with DynamoDB progress reporting.
 
@@ -179,6 +180,10 @@ async def run_pipeline(
         arxiv_url: The arXiv paper URL to process.
         job_id: Unique job identifier for progress tracking.
         job_manager: Optional job manager for progress updates.
+        api_key: Optional caller-supplied Google API key. When set, agents
+            use it directly via :class:`ScopedKeyGemini` instead of
+            ``GOOGLE_API_KEY`` env. The Chrome extension always passes one;
+            the React web UI does not (it relies on the backend ``.env``).
 
     Returns:
         A dict containing:
@@ -220,7 +225,7 @@ async def run_pipeline(
 
         # ---- Stage 2: Translation ----
         await _publish_progress(job_manager, job_id, 2)
-        translation_agent = create_translation_agent(model)
+        translation_agent = create_translation_agent(model, api_key=api_key)
         markdown_ja = await _run_single_agent(
             translation_agent,
             f"Translate the following English Markdown to Japanese:\n\n{markdown_en}",
@@ -229,7 +234,7 @@ async def run_pipeline(
 
         # ---- Stage 3: Summary ----
         await _publish_progress(job_manager, job_id, 3)
-        summary_agent = create_summary_agent(model)
+        summary_agent = create_summary_agent(model, api_key=api_key)
         summary_ja = await _run_single_agent(
             summary_agent,
             (f"Create a summary for the following paper.\narXiv URL: {arxiv_url}\n\nPaper content:\n{markdown_ja}"),
