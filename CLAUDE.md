@@ -20,6 +20,18 @@ docker compose up --build           # backend + web + DynamoDB Local
 - Web UI: http://localhost:5173 — Backend: http://localhost:8000 — DynamoDB Local: http://localhost:8100
 - Hot reload: backend (`backend/src/`) via uvicorn `--reload`, frontend (`frontend/web/src/`) via Vite
 
+**⚠ Docker Desktop on macOS — uvicorn `--reload` quietly misses file edits.** The
+bind mount `./backend/src:/app/src` does not propagate inotify events to the
+container reliably, so `WatchFiles` never sees the change and the Python
+process keeps the old module in memory — even though `docker exec ... md5sum`
+shows the in-container file is up to date. Symptom: a code change to
+`backend/src/...` does not affect the next pipeline run, and the logs are
+silent (no `Detected change`/`Reloading` line). Fix:
+`docker compose restart backend`. Verify it picked up the edit by checking
+for a fresh `Started reloader process` line in `docker logs backend` after
+you saved the file. Do NOT trust the file mtime or md5 alone — they update,
+but the running interpreter does not.
+
 ### Backend (Python 3.12+, FastAPI)
 ```bash
 cd backend
