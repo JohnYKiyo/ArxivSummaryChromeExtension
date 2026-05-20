@@ -10,6 +10,7 @@ arXiv 論文を日本語に翻訳・要約するサービスです。arXiv の U
 - 英語 → 日本語翻訳（Markdown 構造と数式表記を維持）
 - 論文タイプ（通常論文 / サーベイ）に応じたテンプレートで要約生成
 - 進捗のリアルタイム表示（3 秒ポーリング、進捗は 0–100 の整数）
+- 処理中のキャンセル — Web UI と Chrome 拡張のどちらからでも、走行中のジョブを停止可能
 - 成果物の ZIP ダウンロード
 
 > **Note**: PDF しか公開されていない論文（TeX/HTML ソースが無いもの）は変換できません。検出すると `PdfOnlyPaperError` を返し、UI に日本語のエラーメッセージを表示します。
@@ -54,6 +55,14 @@ fetch_arxiv_paper        (tools/arxiv.py)
 ### 進捗連携はポーリング
 
 クライアントは `GET /api/v1/jobs/{job_id}/status` を **3 秒間隔** でポーリングします（SSE は Lambda 互換性のため廃止済み）。Web UI は [useJobPolling](frontend/web/src/features/job-status/hooks/useJobPolling.ts) フックで、拡張機能は [service worker](frontend/chrome-extension/background/service-worker.ts) のループで、同じ間隔で取得します。
+
+### キャンセルは協調式
+
+`POST /api/v1/jobs/{job_id}/cancel` は DynamoDB の `cancel_requested` フラグを立てるだけで、走行中の Lambda やプロセスを直接停止はしません。`run_pipeline()` は各ステージ境界で [`is_cancel_requested`](backend/src/services/job_manager.py) を確認し、検出したら `CANCELLED` 終端状態へクリーンに遷移します。
+
+- レイテンシは最大 1 ステージぶん — 翻訳・要約は LLM ストリーミング中に割り込めないため、その呼び出しが終わるまで待ちます
+- ステータスと別フラグなので、パイプラインの進捗書き込みでキャンセル意図が上書きされません
+- すでに終端 (`completed` / `error` / `cancelled`) のジョブには 409 を返します（冪等）
 
 ## ディレクトリ構成
 
@@ -141,8 +150,8 @@ cdk synth && cdk deploy --all
 
 1. `http://localhost:5173`（ローカル）または CloudFront URL（本番）を開く
 2. arXiv の URL を入力欄に貼り付ける（例：`https://arxiv.org/abs/2301.00001`）
-3. **「変換開始」** をクリック
-4. 進捗バーで各ステージ（ソース取得 → Markdown 変換 → 翻訳 → 要約 → パッケージング）を確認
+3. **「翻訳開始」** をクリック
+4. 進捗バーで各ステージ（ソース取得 → Markdown 変換 → 翻訳 → 要約 → パッケージング）を確認。途中で止めたい場合は **「キャンセル」** をクリック
 5. 完了したら **「ダウンロード」** ボタンで ZIP を取得
 
 Web UI は **バックエンドの `GOOGLE_API_KEY`** を使って翻訳します（`.env` で設定）。
@@ -157,7 +166,7 @@ Web UI は **バックエンドの `GOOGLE_API_KEY`** を使って翻訳しま�
    - **API Endpoint**：`http://localhost:8000`（ローカル）/ `https://<API Gateway URL>`（本番）
    - **Google API Key**：拡張機能はリクエストヘッダ (`X-Google-Api-Key`) で毎回送信するため、ここに入れない限り翻訳は開始できません
 4. **「翻訳を開始」** をクリック
-5. 進捗バーで状態確認 → 完了後 **「ダウンロード (ZIP)」** をクリック
+5. 進捗バーで状態確認 → 完了後 **「ダウンロード (ZIP)」** をクリック。処理中に **「キャンセル」** をクリックすれば次のステージ境界で停止します
 
 #### 拡張機能の挙動メモ
 
@@ -212,7 +221,8 @@ npm run build
 | メソッド | エンドポイント | 説明 |
 |---|---|---|
 | POST | `/api/v1/convert` | 変換ジョブを作成。`X-Google-Api-Key` ヘッダ（任意・拡張機能から使用）で API Key を渡せる。202 を即時返却 |
-| GET | `/api/v1/jobs/{job_id}/status` | ジョブの進捗をポーリング。完了時に `download_url` を返す。`progress` は 0–100 の整数 |
+| GET | `/api/v1/jobs/{job_id}/status` | ジョブの進捗をポーリング。完了時に `download_url` を返す。`progress` は 0–100 の整数。終端ステータスは `completed` / `error` / `cancelled` |
+| POST | `/api/v1/jobs/{job_id}/cancel` | 走行中ジョブのキャンセル要求。次のステージ境界で `cancelled` に遷移する。終端ジョブに対しては 409 |
 | GET | `/api/v1/jobs/{job_id}/download` | ZIP ダウンロード。**`S3_BUCKET_NAME` が未設定（ローカル開発）のときのみ有効**。本番では `status` レスポンスの S3 presigned URL を直接使用 |
 | GET | `/api/v1/health` | ヘルスチェック |
 

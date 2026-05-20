@@ -70,6 +70,9 @@ def mock_job_manager() -> MagicMock:
     mgr.update_progress = AsyncMock()
     mgr.set_result = AsyncMock()
     mgr.set_error = AsyncMock()
+    mgr.request_cancel = AsyncMock(return_value=True)
+    mgr.is_cancel_requested = AsyncMock(return_value=False)
+    mgr.set_cancelled = AsyncMock()
     return mgr
 
 
@@ -238,6 +241,75 @@ class TestStatusEndpoint:
         response = await client.get("/api/v1/jobs/abc123/status")
         assert response.status_code == 200
         assert response.json()["download_url"] == "/api/v1/jobs/abc123/download"
+
+
+# ---------------------------------------------------------------------------
+# POST /jobs/{id}/cancel
+# ---------------------------------------------------------------------------
+
+
+class TestCancelEndpoint:
+    """POST /api/v1/jobs/{job_id}/cancel"""
+
+    async def test_nonexistent_job_returns_404(
+        self, client: AsyncClient, mock_job_manager: MagicMock
+    ) -> None:
+        mock_job_manager.get_job.return_value = None
+        response = await client.post("/api/v1/jobs/missing/cancel")
+        assert response.status_code == 404
+        mock_job_manager.request_cancel.assert_not_awaited()
+
+    async def test_in_flight_job_accepts_cancellation(
+        self, client: AsyncClient, mock_job_manager: MagicMock
+    ) -> None:
+        """An in-flight job returns 200 and triggers request_cancel."""
+        mock_job_manager.get_job.return_value = _make_job(
+            status=JobStatus.TRANSLATION,
+            progress=60,
+            current_step="translation",
+            message="日本語翻訳中...",
+        )
+        response = await client.post("/api/v1/jobs/abc123/cancel")
+        assert response.status_code == 200
+        body = response.json()
+        # Status reflects the still-running stage; the message confirms intent.
+        # The pipeline transitions it to ``cancelled`` at the next checkpoint.
+        assert body["status"] == "translation"
+        assert body["message"] == "キャンセルを受け付けました"
+        mock_job_manager.request_cancel.assert_awaited_once_with("abc123")
+
+    async def test_completed_job_returns_409(
+        self, client: AsyncClient, mock_job_manager: MagicMock
+    ) -> None:
+        mock_job_manager.get_job.return_value = _make_job(
+            status=JobStatus.COMPLETED,
+            progress=100,
+            download_url="/api/v1/jobs/abc123/download",
+        )
+        response = await client.post("/api/v1/jobs/abc123/cancel")
+        assert response.status_code == 409
+        mock_job_manager.request_cancel.assert_not_awaited()
+
+    async def test_already_cancelled_job_returns_409(
+        self, client: AsyncClient, mock_job_manager: MagicMock
+    ) -> None:
+        mock_job_manager.get_job.return_value = _make_job(
+            status=JobStatus.CANCELLED,
+        )
+        response = await client.post("/api/v1/jobs/abc123/cancel")
+        assert response.status_code == 409
+        mock_job_manager.request_cancel.assert_not_awaited()
+
+    async def test_errored_job_returns_409(
+        self, client: AsyncClient, mock_job_manager: MagicMock
+    ) -> None:
+        mock_job_manager.get_job.return_value = _make_job(
+            status=JobStatus.ERROR,
+            error="boom",
+        )
+        response = await client.post("/api/v1/jobs/abc123/cancel")
+        assert response.status_code == 409
+        mock_job_manager.request_cancel.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
