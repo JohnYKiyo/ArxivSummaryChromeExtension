@@ -830,6 +830,75 @@ def test_raises_when_pandoc_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         tex_to_markdown(r"\documentclass{article}\begin{document}x\end{document}", work_dir=tmp_path)
 
 
+def test_commented_title_does_not_shadow_real_title(tmp_path: Path) -> None:
+    r"""``% \title{Placeholder}`` above the real ``\title{...}`` must not win.
+
+    Reproduces the 2601.11516 (Google DeepMind Probes) failure mode: their
+    ``boilerplate.tex`` ships the template placeholder commented out one
+    line above the real declaration::
+
+        % \title{Using the Google DeepMind \LaTeX ~Style}
+        \title{Building Production-Ready Probes For Gemini}
+
+    Before the fix, the metadata regex picked the *first* textual
+    ``\title{`` — i.e. the commented placeholder — and the rendered paper
+    carried the template's filler title.
+    """
+    from src.tools.arxiv import _find_command_inner
+
+    tex = "\n".join(
+        [
+            r"\documentclass{article}",
+            r"% \title{Placeholder Title}",
+            r"\title{Real Title}",
+            r"\begin{document}",
+            r"\maketitle",
+            r"\end{document}",
+        ]
+    )
+    assert _find_command_inner(tex, "title") == "Real Title"
+
+    rewritten = _extract_metadata_and_rewrite(tex)
+    md = tex_to_markdown(rewritten, work_dir=tmp_path)
+    assert "Placeholder Title" not in md, md
+    assert re.search(r"^#\s+Real Title", md, re.MULTILINE), md
+
+
+def test_commented_begin_abstract_does_not_shadow_real_abstract(tmp_path: Path) -> None:
+    r"""A commented ``% \begin{abstract}`` must not be picked up as the abstract.
+
+    Same shape as the title bug but for the abstract environment: a
+    commented-out template line shouldn't shadow the real
+    ``\begin{abstract}...\end{abstract}`` below it.
+    """
+    from src.tools.arxiv import _find_environment_body
+
+    tex = "\n".join(
+        [
+            r"% \begin{abstract} placeholder body \end{abstract}",
+            r"\begin{abstract}",
+            r"Real abstract content.",
+            r"\end{abstract}",
+        ]
+    )
+    body = _find_environment_body(tex, "abstract")
+    assert body is not None
+    assert "Real abstract content." in body
+    assert "placeholder body" not in body
+
+
+def test_escaped_percent_does_not_start_a_comment() -> None:
+    r"""``\%`` is a literal percent — must not be treated as a comment start.
+
+    Otherwise ``\title{50\% off}`` would be parsed as ``\title{50`` plus a
+    comment, and we'd extract the wrong inner.
+    """
+    from src.tools.arxiv import _find_command_inner
+
+    tex = r"\title{50\% off and more}"
+    assert _find_command_inner(tex, "title") == r"50\% off and more"
+
+
 def test_title_block_renders_after_metadata_rewrite(tmp_path: Path) -> None:
     """End-to-end: TeX with \\title/\\author/abstract → Markdown with H1/authors/H2 Abstract.
 

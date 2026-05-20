@@ -453,17 +453,54 @@ def _match_balanced_brace(text: str, open_pos: int) -> int:
     raise ValueError("Unbalanced braces")
 
 
+def _is_in_line_comment(text: str, pos: int) -> bool:
+    """Return ``True`` if *pos* in *text* falls inside a LaTeX line comment.
+
+    LaTeX line comments start at an *unescaped* ``%`` and run to end of line.
+    A ``\\%`` is a literal percent sign and does NOT start a comment. We walk
+    from the previous newline up to *pos* tracking escapes; if we encounter
+    an unescaped ``%`` first, *pos* is inside the comment.
+
+    Author templates commonly ship with the original placeholder lines
+    commented out::
+
+        % \\title{Placeholder Title}
+        \\title{Actual Title}
+
+    Without this check, a naive ``re.search`` for ``\\title{`` picks the
+    placeholder (the first textual match) and the rendered paper carries
+    the wrong title.
+    """
+    line_start = text.rfind("\n", 0, pos) + 1
+    i = line_start
+    while i < pos:
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            i += 2  # skip escaped character (in particular ``\%``)
+            continue
+        if ch == "%":
+            return True
+        i += 1
+    return False
+
+
 def _find_command_inner(tex: str, command: str) -> str | None:
-    """Return the contents of the first ``\\command{...}`` in *tex*, or ``None``."""
+    """Return the contents of the first ``\\command{...}`` in *tex*, or ``None``.
+
+    Skips matches that fall inside a TeX ``%`` line comment so commented-out
+    template lines like ``% \\title{Placeholder}`` do not shadow the real
+    declaration on the next line.
+    """
     pattern = re.compile(r"\\" + re.escape(command) + r"\s*\{")
-    m = pattern.search(tex)
-    if not m:
-        return None
-    try:
-        close = _match_balanced_brace(tex, m.end() - 1)
-    except ValueError:
-        return None
-    return tex[m.end() : close]
+    for m in pattern.finditer(tex):
+        if _is_in_line_comment(tex, m.start()):
+            continue
+        try:
+            close = _match_balanced_brace(tex, m.end() - 1)
+        except ValueError:
+            continue
+        return tex[m.end() : close]
+    return None
 
 
 def _strip_command(tex: str, command: str) -> str:
@@ -531,14 +568,21 @@ def _icml_affiliations_joined(tex: str) -> str | None:
 
 
 def _find_environment_body(tex: str, env: str) -> str | None:
-    """Return the body of the first ``\\begin{env}...\\end{env}`` block, or ``None``."""
-    begin = re.search(r"\\begin\{" + re.escape(env) + r"\}", tex)
-    if not begin:
-        return None
-    end = re.search(r"\\end\{" + re.escape(env) + r"\}", tex[begin.end() :])
-    if not end:
-        return None
-    return tex[begin.end() : begin.end() + end.start()]
+    """Return the body of the first ``\\begin{env}...\\end{env}`` block, or ``None``.
+
+    Skips ``\\begin{env}`` matches that are inside a ``%`` line comment — a
+    commented-out template ``% \\begin{abstract}`` should not shadow the
+    real one further down.
+    """
+    begin_pattern = re.compile(r"\\begin\{" + re.escape(env) + r"\}")
+    for begin in begin_pattern.finditer(tex):
+        if _is_in_line_comment(tex, begin.start()):
+            continue
+        end = re.search(r"\\end\{" + re.escape(env) + r"\}", tex[begin.end() :])
+        if not end:
+            return None
+        return tex[begin.end() : begin.end() + end.start()]
+    return None
 
 
 def _strip_environment(tex: str, env: str) -> str:
