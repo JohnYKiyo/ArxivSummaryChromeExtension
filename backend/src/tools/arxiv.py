@@ -494,6 +494,7 @@ def _strip_two_arg_command(tex: str, command: str) -> str:
 
 
 _ICML_AUTHOR_RE = re.compile(r"\\icmlauthor\s*\{([^{}]+)\}\s*\{[^{}]*\}")
+_ICML_AFFILIATION_RE = re.compile(r"\\icmlaffiliation\s*\{[^{}]*\}\s*\{([^{}]+)\}")
 
 
 def _icml_authors_joined(tex: str) -> str | None:
@@ -508,6 +509,25 @@ def _icml_authors_joined(tex: str) -> str | None:
     if not names:
         return None
     return r" \and ".join(names)
+
+
+def _icml_affiliations_joined(tex: str) -> str | None:
+    """Collect institution names from every ``\\icmlaffiliation{key}{Name}``.
+
+    Duplicate institutions are folded to a single entry (in source order)
+    so the comma-separated list reads naturally. Returns ``None`` if no
+    ``\\icmlaffiliation`` appears.
+    """
+    seen: set[str] = set()
+    unique: list[str] = []
+    for match in _ICML_AFFILIATION_RE.finditer(tex):
+        name = match.group(1).strip()
+        if name and name not in seen:
+            seen.add(name)
+            unique.append(name)
+    if not unique:
+        return None
+    return ", ".join(unique)
 
 
 def _find_environment_body(tex: str, env: str) -> str | None:
@@ -584,6 +604,13 @@ def _extract_metadata_and_rewrite(tex: str) -> str:
         authors = _clean_author_list(author_inner)
         if authors:
             block_parts.append("\\textit{" + authors + "}")
+    # ICML papers separate affiliations into ``\icmlaffiliation{key}{Name}``
+    # entries that we'd otherwise strip and lose. Surface them as their own
+    # ``\textit{}`` line so the summary agent and the translated Markdown
+    # both have the institution information.
+    affiliations = _icml_affiliations_joined(tex)
+    if affiliations:
+        block_parts.append("\\textit{" + affiliations + "}")
     if abstract_body is not None:
         block_parts.append("\\section*{Abstract}\n" + abstract_body.strip())
 

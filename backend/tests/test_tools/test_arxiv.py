@@ -183,6 +183,9 @@ def test_extract_metadata_icml_template_recognised() -> None:
     assert r"\section*{Rethinking the Role of LLMs in Time Series Forecasting}" in out
     # All three authors collected, in source order, with commas.
     assert r"\textit{Xin Qiu, Junlong Tong, Yirong Sun}" in out
+    # Affiliations surfaced (deduplicated) so the summary agent has the
+    # institution information available.
+    assert r"\textit{Eastern Institute of Technology, Zhejiang University}" in out
     # Abstract preserved as \section*.
     assert r"\section*{Abstract}" in out
     assert "Abstract body." in out
