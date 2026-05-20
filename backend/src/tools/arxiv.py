@@ -343,41 +343,64 @@ def _find_main_tex_file(tex_files: list[Path]) -> Path:
     return main
 
 
-def _expand_inputs(tex: str, base_dir: Path, depth: int = 0, seen: set[Path] | None = None) -> str:
+def _expand_inputs(
+    tex: str,
+    base_dir: Path,
+    depth: int = 0,
+    seen: set[Path] | None = None,
+    root_dir: Path | None = None,
+) -> str:
     """Inline ``\\input{...}``, ``\\include{...}`` and ``\\bibliography{...}`` directives.
 
-    For ``\\input`` / ``\\include``: looks for each referenced file relative to
-    ``base_dir``, trying both the literal path and the path with a ``.tex``
-    extension appended. Cycles are broken by tracking already-included files.
-    Unresolved directives are left as-is.
+    For ``\\input`` / ``\\include``: looks for each referenced file first
+    relative to ``base_dir`` (the current file's directory) and then
+    relative to ``root_dir`` (the main TeX file's directory), trying both
+    the literal path and the path with a ``.tex`` extension appended. The
+    root-relative fallback mirrors LaTeX's ``TEXINPUTS`` behaviour:
+    project-level resources like ``tables/foo.tex`` get referenced by
+    their root-relative path from inside a nested chapter file, not by
+    ``../tables/foo.tex``. Cycles are broken by tracking already-included
+    files. Unresolved directives are left as-is.
 
     For ``\\bibliography{name}``: arXiv submissions usually ship a pre-built
     ``<name>.bbl`` (BibTeX output containing ``\\thebibliography`` /
     ``\\bibitem``). We inline that .bbl in place of the directive, preceded by
     ``\\section*{References}`` so pandoc emits a proper References heading.
     Falls back to any ``*.bbl`` in the source tree when the named one is
-    missing (most arXiv tarballs contain exactly one .bbl).
+    missing (most arXiv tarballs contain exactly one .bbl). The search is
+    rooted at ``root_dir`` so a ``\\bibliography`` directive inside a
+    nested ``\\input`` still finds the .bbl that lives next to the main
+    TeX file.
 
     ``\\bibliographystyle{...}`` is stripped — pandoc doesn't need it.
 
     Args:
         tex: The TeX content to scan.
-        base_dir: Directory to resolve relative paths against.
+        base_dir: Directory to resolve relative paths against at the current
+            level of expansion.
         depth: Current recursion depth (used internally).
         seen: Set of already-included resolved paths (used internally).
+        root_dir: The main TeX file's directory; secondary lookup root for
+            ``\\input`` and the search root for ``.bbl`` files. Defaults to
+            ``base_dir`` (i.e., callers at the top level can omit it).
 
     Returns:
         ``tex`` with all resolvable directives inlined.
     """
     if seen is None:
         seen = set()
+    if root_dir is None:
+        root_dir = base_dir
     if depth > _MAX_INPUT_DEPTH:
         logger.warning("Reached max \\input expansion depth (%d); halting", _MAX_INPUT_DEPTH)
         return tex
 
     def _resolve(arg: str) -> Path | None:
         arg = arg.strip()
-        for candidate in (base_dir / arg, base_dir / f"{arg}.tex"):
+        candidates: list[Path] = [base_dir / arg, base_dir / f"{arg}.tex"]
+        if root_dir != base_dir:
+            candidates.extend([root_dir / arg, root_dir / f"{arg}.tex"])
+        for candidate in candidates:
             if candidate.is_file():
                 return candidate.resolve()
         return None
@@ -390,7 +413,7 @@ def _expand_inputs(tex: str, base_dir: Path, depth: int = 0, seen: set[Path] | N
             return ""  # cycle — drop the directive
         seen.add(path)
         inner = path.read_text(encoding="utf-8", errors="replace")
-        return _expand_inputs(inner, path.parent, depth + 1, seen)
+        return _expand_inputs(inner, path.parent, depth + 1, seen, root_dir)
 
     tex = _INPUT_DIRECTIVE.sub(_replace_input, tex)
 
@@ -401,13 +424,13 @@ def _expand_inputs(tex: str, base_dir: Path, depth: int = 0, seen: set[Path] | N
         names = [n.strip() for n in match.group(1).split(",") if n.strip()]
         bbl_path: Path | None = None
         for name in names:
-            candidates = list(base_dir.rglob(f"{name}.bbl"))
+            candidates = list(root_dir.rglob(f"{name}.bbl"))
             if candidates:
                 bbl_path = candidates[0]
                 break
         if bbl_path is None:
             # Common case: only one .bbl in the tarball; use it regardless of name.
-            any_bbl = list(base_dir.rglob("*.bbl"))
+            any_bbl = list(root_dir.rglob("*.bbl"))
             if any_bbl:
                 bbl_path = any_bbl[0]
         if bbl_path is None:
@@ -420,7 +443,7 @@ def _expand_inputs(tex: str, base_dir: Path, depth: int = 0, seen: set[Path] | N
             return ""
         seen.add(bbl_path)
         bbl_content = bbl_path.read_text(encoding="utf-8", errors="replace")
-        expanded_bbl = _expand_inputs(bbl_content, bbl_path.parent, depth + 1, seen)
+        expanded_bbl = _expand_inputs(bbl_content, bbl_path.parent, depth + 1, seen, root_dir)
         return "\\section*{References}\n" + expanded_bbl
 
     tex = _BIBLIOGRAPHY_DIRECTIVE.sub(_replace_bibliography, tex)
@@ -784,7 +807,7 @@ def extract_source(tar_path: Path, output_dir: Path) -> tuple[str, list[Path]]:
 
     main_tex = _find_main_tex_file(tex_files)
     raw_content = main_tex.read_text(encoding="utf-8", errors="replace")
-    expanded = _expand_inputs(raw_content, main_tex.parent)
+    expanded = _expand_inputs(raw_content, main_tex.parent, root_dir=main_tex.parent)
     expanded = _extract_metadata_and_rewrite(expanded)
 
     # Some submissions are TeX wrappers that just embed a PDF. There is no
