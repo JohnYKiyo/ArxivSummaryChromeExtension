@@ -16,7 +16,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import FileResponse
 
 from src.api.auth import get_current_user
@@ -79,18 +79,28 @@ router = APIRouter(prefix="/api/v1", tags=["v1"])
 async def create_conversion(
     body: ConvertRequest,
     _user: dict[str, Any] = Depends(get_current_user),
+    x_google_api_key: str | None = Header(default=None, alias="X-Google-Api-Key"),
 ) -> ConvertResponse:
     """Create a new arXiv paper conversion job.
 
     Validates the URL, creates a job record in DynamoDB, and asks the
     dispatcher to start the pipeline. Returns 202 Accepted with the job
     ID and status polling URL.
+
+    The ``X-Google-Api-Key`` header is optional: the Chrome extension
+    always sets it (user-supplied key from the extension's settings),
+    while the React web UI omits it and relies on the backend's
+    ``GOOGLE_API_KEY`` env var.
     """
     job_manager = _get_job_manager()
     dispatcher = _get_dispatcher()
 
     job = await job_manager.create_job(body.arxiv_url)
-    await dispatcher.dispatch(job.job_id, body.arxiv_url)
+    # Treat empty strings as "no key" so an extension that forgot to populate
+    # the field falls back to the env-based path instead of hitting Gemini
+    # with an empty credential.
+    api_key = x_google_api_key.strip() if x_google_api_key else None
+    await dispatcher.dispatch(job.job_id, body.arxiv_url, api_key=api_key or None)
 
     return ConvertResponse(
         job_id=job.job_id,

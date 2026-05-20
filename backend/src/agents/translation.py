@@ -10,6 +10,8 @@ truncation.
 from google.adk.agents import LlmAgent
 from google.genai import types as genai_types
 
+from src.agents._llm import ScopedKeyGemini
+
 _TRANSLATION_INSTRUCTION = """\
 You are a professional English-to-Japanese translator specialising in \
 scientific and technical papers.
@@ -73,19 +75,26 @@ Return ONLY the translated Markdown document. Do not include:
 """
 
 
-def create_translation_agent(model: str) -> LlmAgent:
+def create_translation_agent(model: str, *, api_key: str | None = None) -> LlmAgent:
     """Create a TranslationAgent for English-to-Japanese Markdown translation.
 
     Args:
         model: The LLM model identifier (e.g. ``"gemini-2.5-pro"``).
+        api_key: Optional caller-supplied Google API key. When provided the
+            agent is wrapped in :class:`ScopedKeyGemini` so the underlying
+            ``genai.Client`` uses this key directly instead of reading
+            ``GOOGLE_API_KEY`` from the process env. When omitted the
+            model is passed by name and ADK falls back to env-based
+            credentials (web UI / Lambda baseline).
 
     Returns:
         A configured :class:`LlmAgent` with the model's maximum output
         token budget allocated so long papers translate without truncation.
     """
+    llm: str | ScopedKeyGemini = ScopedKeyGemini(model=model, api_key=api_key) if api_key else model
     return LlmAgent(
         name="TranslationAgent",
-        model=model,
+        model=llm,
         instruction=_TRANSLATION_INSTRUCTION,
         description=(
             "Translates English Markdown documents into Japanese while "
