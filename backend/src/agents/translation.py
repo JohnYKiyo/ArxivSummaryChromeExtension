@@ -31,6 +31,10 @@ lists (``-``, ``1.``), bold (``**``), italic (``*``), inline code (`` ` ``), \
 links (``[text](url)``), images (``![alt](path)``), pipe tables.
    - Do not add or remove any Markdown elements.
    - The heading hierarchy must match the source exactly.
+   - Image references (``<img>``, ``<figure>``, ``![]()``) must be COPIED \
+EXACTLY from the source — do not invent new ones, do not change ``src`` \
+paths, do not add ``<img>`` to figure blocks that don't already have one. \
+If the source figure has no image tag, the output figure has none either.
 
 2. **Technical terms**
    - On the first occurrence of a domain-specific term, render it as \
@@ -51,7 +55,9 @@ LaTeX exactly as given, character for character.
 journal titles stay in their original script.
    - Email addresses, URLs, citation keys (e.g. ``[Author et al., 2020]``, \
 ``[bib.42]``), DOI strings, GitHub paths stay unchanged.
-   - Image paths (``images/figure1.png``) stay unchanged.
+   - Image paths inside ``<img src="...">`` and ``![alt](...)`` stay \
+character-for-character identical to the source. Do not normalise, \
+renumber, or substitute filenames.
 
 5. **Boilerplate and metadata**
    - License notices, copyright statements, and "Refer to caption" alt \
