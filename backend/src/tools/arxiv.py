@@ -561,8 +561,16 @@ def _extract_metadata_and_rewrite(tex: str) -> str:
     result = _strip_command(result, "author")
     result = _strip_environment(result, "abstract")
 
-    if "\\maketitle" in result:
-        result = result.replace("\\maketitle", title_block, 1)
+    # Replace only ``\maketitle`` invocations, not occurrences inside
+    # ``\renewcommand{\maketitle}{...}`` (where ``\maketitle`` is followed
+    # by ``}``) nor longer command names beginning with ``maketitle``.
+    # The bare ``str.replace`` we used previously hit the first textual
+    # match — which on papers that redefine ``\maketitle`` was inside the
+    # ``\renewcommand`` brace, producing ``\renewcommand{\section*{...}``
+    # and crashing pandoc.
+    maketitle_invocation = re.compile(r"\\maketitle(?![a-zA-Z}])")
+    if maketitle_invocation.search(result):
+        result = maketitle_invocation.sub(lambda _m: title_block, result, count=1)
     else:
         doc_begin = re.search(r"\\begin\{document\}", result)
         if doc_begin:

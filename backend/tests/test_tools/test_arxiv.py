@@ -42,15 +42,21 @@ def test_match_balanced_brace_escaped_braces_ignored() -> None:
 
 
 def test_extract_metadata_basic() -> None:
-    tex = (
-        r"\documentclass{article}"
-        r"\title{Foo}"
-        r"\author{Alice \and Bob}"
-        r"\begin{document}"
-        r"\maketitle"
-        r"\begin{abstract}X\end{abstract}"
-        r"Body"
-        r"\end{document}"
+    # Use the LaTeX-realistic shape: ``\maketitle`` followed by a newline.
+    # A purely concatenated form ``\maketitle\begin{abstract}...Body`` is
+    # technically ill-formed (TeX would lex ``\maketitleBody`` as one
+    # command-name token), and we now refuse to mangle that case.
+    tex = "\n".join(
+        [
+            r"\documentclass{article}",
+            r"\title{Foo}",
+            r"\author{Alice \and Bob}",
+            r"\begin{document}",
+            r"\maketitle",
+            r"\begin{abstract}X\end{abstract}",
+            r"Body",
+            r"\end{document}",
+        ]
     )
     out = _extract_metadata_and_rewrite(tex)
     # Title / authors / abstract block is present in order.
@@ -120,6 +126,50 @@ def test_extract_metadata_no_maketitle_inserts_after_begin_document() -> None:
     title_idx = out.index(r"\section*{T}")
     body_idx = out.index("Body")
     assert doc_idx < title_idx < body_idx
+
+
+def test_extract_metadata_does_not_replace_renewcommand_arg() -> None:
+    """``\\renewcommand{\\maketitle}{...}`` redefines ``\\maketitle`` and contains
+    ``\\maketitle`` as a token (followed by ``}``) — that occurrence must not
+    be substituted for the title block. Only the bare ``\\maketitle`` command
+    invocation gets replaced.
+    """
+    tex = (
+        r"\documentclass{article}"
+        r"\title{Meet Your New Client}"
+        r"\author{Paul}"
+        r"\renewcommand{\maketitle}{\begin{center}Custom\end{center}}"
+        r"\begin{document}"
+        r"\maketitle"
+        r"Body of paper."
+        r"\end{document}"
+    )
+    out = _extract_metadata_and_rewrite(tex)
+    # The renewcommand's brace must still contain \maketitle (as a token).
+    assert r"\renewcommand{\maketitle}" in out
+    # The synthesized title block appears once, replacing the bare \maketitle.
+    assert r"\section*{Meet Your New Client}" in out
+    assert out.count(r"\section*{Meet Your New Client}") == 1
+    # The pathological output that crashed pandoc must NOT appear.
+    assert r"\renewcommand{\section*" not in out
+
+
+def test_extract_metadata_does_not_match_longer_command_names() -> None:
+    """``\\maketitlefigure`` (a different command) must not be mistaken for
+    ``\\maketitle``."""
+    tex = (
+        r"\documentclass{article}\title{T}"
+        r"\begin{document}"
+        r"\maketitlefigure"
+        r"\end{document}"
+    )
+    out = _extract_metadata_and_rewrite(tex)
+    # The longer command stays intact.
+    assert r"\maketitlefigure" in out
+    # Title block is inserted at \begin{document} since no bare \maketitle exists.
+    doc_idx = out.index(r"\begin{document}")
+    title_idx = out.index(r"\section*{T}")
+    assert doc_idx < title_idx < out.index(r"\maketitlefigure")
 
 
 def test_clean_author_list_collapses_whitespace_and_commas() -> None:
