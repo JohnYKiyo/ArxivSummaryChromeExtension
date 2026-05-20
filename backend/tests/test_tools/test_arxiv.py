@@ -283,6 +283,31 @@ def test_clean_author_list_collapses_whitespace_and_commas() -> None:
     assert _clean_author_list(raw) == "Alice, Bob, Charlie, Dave"
 
 
+def test_clean_author_list_drops_trailing_control_space() -> None:
+    """Lone ``\\`` followed by whitespace inside ``\\author{}`` must be dropped.
+
+    ICLR-style author blocks (e.g. arXiv 2605.05242) end every name line
+    with ``Name \\<EOL>``. The lone backslash is a TeX control space —
+    semantically a single space. If it survives our cleaner, the wrapping
+    ``\\textit{<authors>}`` ends in ``\\}`` (an escaped literal ``}``)
+    which does *not* close the ``\\textit{`` group, so pandoc reads
+    through the next paragraph break and aborts with ``unexpected ()``
+    at the following ``\\section*{Abstract}``.
+    """
+    raw = (
+        "\\vspace{-2em} \\\\\n"
+        "    \\textbf{Alice}$^{1}$ \\\n"
+        "    \\textbf{Bob}$^{2}$ \\\\\n"
+        "    $^{1}$Acme \\\n"
+        "    $^{2}$Lambda \\\n"
+    )
+    out = _clean_author_list(raw)
+    assert not out.endswith("\\"), f"trailing backslash survived: {out!r}"
+    assert "Alice" in out
+    assert "Bob" in out
+    assert "Lambda" in out
+
+
 def test_expand_inputs_inlines_bbl(tmp_path: Path) -> None:
     (tmp_path / "main.tex").write_text(
         r"Body \bibliographystyle{plain} \bibliography{refs}",
