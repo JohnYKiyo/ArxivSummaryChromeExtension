@@ -50,7 +50,6 @@ function copyStatic() {
 
 const entryPoints = [
   { in: "background/service-worker.ts", out: "background/service-worker" },
-  { in: "content/content.ts", out: "content/content" },
   { in: "popup/popup.tsx", out: "popup/popup" },
 ];
 

@@ -46,7 +46,16 @@ class StorageStack(Stack):
         Tags.of(self.frontend_bucket).add("Project", "arxiv-translator")
 
         # -----------------------------------------------------------
-        # ZIP Output Bucket (temporary storage, 1-hour lifecycle)
+        # ZIP Output Bucket (temporary storage, 1-day lifecycle)
+        #
+        # The user-facing download window is 1 hour, enforced by:
+        #   - S3 presigned URL signature (S3_PRESIGNED_URL_EXPIRY = 3600 s)
+        #   - DynamoDB job TTL              (JOB_TTL_SECONDS        = 3600 s)
+        # After 1 hour the URL 403s and the job record is gone, so the file
+        # is unreachable even though it physically remains. S3 Lifecycle
+        # ``expiration`` only supports day-granularity, so the bucket-side
+        # cleanup runs at 1 day — the cheapest setting that still bounds
+        # storage cost for ZIPs nobody picks up.
         # -----------------------------------------------------------
         self.zip_bucket = s3.Bucket(
             self,
@@ -58,7 +67,7 @@ class StorageStack(Stack):
             encryption=s3.BucketEncryption.S3_MANAGED,
             lifecycle_rules=[
                 s3.LifecycleRule(
-                    id="DeleteAfterOneHour",
+                    id="DeleteAfterOneDay",
                     expiration=Duration.days(1),
                     enabled=True,
                 ),

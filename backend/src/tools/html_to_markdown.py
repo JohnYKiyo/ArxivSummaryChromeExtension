@@ -20,6 +20,8 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup, NavigableString, Tag
 from markdownify import markdownify as _markdownify
 
+from src.tools.markdown_layout import isolate_display_math, strip_math_labels
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,6 +83,8 @@ def html_to_markdown(html: str, base_url: str | None = None) -> str:
         for selector in _ARTICLE_NOISE_SELECTORS:
             for el in article.select(selector):
                 el.decompose()
+        _strip_author_affiliation_markers(article)
+        _normalize_section_headings(article)
         root: Tag = article
     else:
         # Non-arXiv HTML or non-standard layout: fall back to <body>.
@@ -98,6 +102,8 @@ def html_to_markdown(html: str, base_url: str | None = None) -> str:
     )
 
     markdown = _restore_math(markdown, math_sources)
+    markdown = strip_math_labels(markdown)
+    markdown = isolate_display_math(markdown)
     markdown = _EXCESS_BLANK_LINES.sub("\n\n", markdown)
     return markdown.strip() + "\n"
 
@@ -105,6 +111,36 @@ def html_to_markdown(html: str, base_url: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
+
+def _strip_author_affiliation_markers(soup: Tag) -> None:
+    """Drop affiliation/footnote markers attached to author names.
+
+    LaTeXML emits affiliation markers next to each author name as either
+    ``<math alttext="{}^{1^{*}}">`` (a math element wrapping a typeset
+    superscript) or ``<sup>1</sup>``. In Markdown the first becomes noisy
+    inline math (``${}^{1^{*}}$``) and the second becomes a stray digit
+    ("Mehrdad Asadi1"). Both confuse the downstream translator. The full
+    affiliation list is preserved inside ``span.ltx_author_notes`` after
+    the names, so removing per-name markers loses no information.
+    """
+    for personname in soup.select("span.ltx_personname"):
+        for marker in personname.find_all(["math", "sup"]):
+            marker.decompose()
+
+
+def _normalize_section_headings(soup: Tag) -> None:
+    """Promote LaTeXML's ``<h6>`` for abstract/keywords blocks to ``<h2>``.
+
+    LaTeXML always emits ``<h6 class="ltx_title_abstract">Abstract</h6>``
+    while body sections use ``<h2>``. Markdownify renders the abstract as
+    ``###### Abstract``, sitting below sub-subsections in the outline,
+    which both breaks the visual hierarchy and confuses tools that rely
+    on heading levels (the translator's "heading hierarchy must match the
+    source" rule then preserves the breakage). Lift these to ``<h2>``.
+    """
+    for h6 in soup.select("h6.ltx_title_abstract, h6.ltx_title_classification"):
+        h6.name = "h2"
 
 
 def _stash_math_as_placeholders(soup: Tag) -> list[str]:

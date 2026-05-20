@@ -21,12 +21,78 @@ This module performs no LLM calls and lives in ``tools/`` (not
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
+from src.tools.markdown_layout import isolate_display_math, strip_math_labels
+
 logger = logging.getLogger(__name__)
+
+
+# Pandoc citations: ``\cite{Lin:1992}`` becomes ``[@Lin:1992]`` in Markdown
+# via the ``citations`` extension. Disabling that extension makes pandoc
+# drop the citations entirely (leaving dangling commas), so we keep the
+# extension on and strip the ``@`` marker post-pandoc so the rendered
+# text is a plain ``[Lin:1992]`` label — readable in every Markdown viewer
+# without depending on the pandoc-citation extension.
+#
+# Match ``@`` that's at a word boundary (preceded by a non-identifier char)
+# and followed by an identifier-shaped citation key. Applied globally so
+# in-text citations (``as @Mnih:2015 showed``) and bracketed forms
+# (``[@Mnih:2015]``) are both cleaned. The lookbehind excludes
+# email-like ``user@example.com`` and any ``@`` preceded by identifier
+# characters, which is the conservative thing for academic prose.
+_CITATION_AT_SIGN = re.compile(r"(?<![A-Za-z0-9_])@(?=[A-Za-z][\w:.\-]*)")
+
+# Image-reference rewriting. The TeX path ships every figure under
+# ``images/`` in the result ZIP (packaging.py:64), but pandoc emits bare
+# filenames as ``\includegraphics{name}`` → ``![](name)``. We rewrite to
+# ``![](images/name.ext)`` so the markdown actually points to the file
+# the user has on disk after unzipping. PDF/EPS extensions are rewritten
+# to ``.png`` because (a) we convert those at extraction time via
+# ``image_convert.convert_pdf_figures_to_png`` and (b) Obsidian / GitHub /
+# VS Code preview cannot render PDF or EPS inline.
+_RENDERABLE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"})
+_CONVERTED_TO_PNG_EXTS = frozenset({".pdf", ".eps"})
+# Markdown image with optional trailing attribute block; the block is dropped.
+_MD_IMAGE = re.compile(r"(!\[[^\]]*\])\(([^)\s]+)\)(?:\{[^{}]*\})?")
+# Raw HTML ``<img src="...">`` or ``<embed src="...pdf">`` (pandoc emits
+# ``<embed>`` for PDFs since the spec says PDFs can't go in ``<img>``).
+# We canonicalise both to ``<img>`` because we've already converted PDFs
+# to PNGs upstream — ``<img src="...png">`` works everywhere.
+_HTML_IMG_OR_EMBED = re.compile(
+    r"<(?:img|embed)\b([^>]*?)src=[\"']([^\"']+)[\"']([^>]*?)\s*/?>",
+    re.IGNORECASE,
+)
+
+# Pandoc raw HTML ``<div>`` wrappers emitted for ``figure*`` / ``figure`` /
+# ``center`` environments and for any environment carrying a ``\label{...}``
+# (which pandoc turns into ``<div id="label">``). All three are
+# pandoc-specific structural hints with no visible effect in standard
+# viewers — bare opener / closer tags appear as preformatted text.
+# We accept ``id`` and/or the figure-flavoured ``class`` attribute in
+# either order; ``<div class="theorem">`` and other named classes are
+# left alone since they may convey real document structure.
+_DIV_WRAPPER_OPEN = re.compile(
+    r"^<div"
+    r'(?:\s+(?:id="[^"]*"|class="(?:figure\*?|center)"))+'
+    r"\s*>\s*$"
+)
+_DIV_CLOSE = re.compile(r"^</div>\s*$")
+
+# Pandoc ``<a href="#anchor" data-reference-type="ref" data-reference="...">text</a>``
+# emitted for ``\ref{...}`` / ``\eqref{...}`` cross-references. The
+# ``data-*`` attributes are pandoc-specific; standard Markdown viewers
+# show the whole ``<a>`` raw. Internal anchors aren't resolved either
+# (we don't emit matching ``id=""`` on headings). Drop the wrapper —
+# keep the inner text.
+_PANDOC_CROSSREF = re.compile(
+    r"<a\s+[^>]*?\bdata-reference-type=[\"'][^\"']*[\"'][^>]*>([^<]*)</a>",
+    re.IGNORECASE,
+)
 
 
 class PandocNotInstalledError(RuntimeError):
@@ -39,8 +105,62 @@ class PandocConversionError(RuntimeError):
 
 # Pandoc options. Kept module-level so the choice is easy to audit and the
 # command is identical between production runs and tests.
+#
+# Disabled extensions explained:
+#   - raw_tex          : we don't want raw TeX leaking into the Markdown
+#   - header_attributes: pandoc emits ``# Heading {#anchor .unnumbered}``
+#                        which renders as literal text in GitHub, Obsidian,
+#                        VS Code preview, etc.
+#   - link_attributes  : pandoc emits ``[text](url){reference-type="eqref"
+#                        reference="X"}`` for cross-refs and ``{width="3in"}``
+#                        for images — same problem, shows as noise.
+#   - fenced_divs      : pandoc wraps figure*/table* environments in
+#                        ``::: figure* ... :::`` blocks which standard MD
+#                        renders verbatim. The inner content survives.
+# Malformed citation arguments authors sometimes commit:
+#   \cite{,Key}      — leading comma
+#   \cite{Key,}      — trailing comma
+#   \cite{A,,B}      — duplicate comma
+#   \cite{ , Key }   — whitespace-padded
+# LaTeX itself silently accepts these. Pandoc's strict parser aborts with
+# ``unexpected ,`` (exit 64) on the leading-comma form. Fix in the input
+# layer so pandoc gets a clean citation list. Matches the whole ``cite``
+# family (``\cite``, ``\citep``, ``\citet``, ``\citeyear`` etc.).
+_CITE_FAMILY = re.compile(r"\\(cite[a-zA-Z]*)(\[[^\]]*\])*\s*\{([^{}]*)\}")
+
+# TeX low-level spacing commands. Custom-typeset papers (e.g. ones with
+# redefined ``\preauthor`` / ``\maketitlehookX`` / hand-rolled keyword
+# blocks) sprinkle these throughout — and after we strip the abstract
+# environment they sometimes end up as bare ``\vskip 3em`` lines in the
+# document body, which pandoc's LaTeX reader rejects with
+# ``unexpected \vskip`` (exit 64). They are purely typographic, so
+# dropping them does not change semantic content.
+_TEX_SKIP_LENGTH = re.compile(
+    r"\\(?:vskip|hskip|kern|lineskip)"
+    r"(?:\s+-?\d+(?:\.\d+)?\s*[A-Za-z]+)?"
+)
+_TEX_SPACE_BRACED = re.compile(r"\\(?:vspace|hspace)\*?\s*\{[^{}]*\}")
+_TEX_SKIP_BARE = re.compile(r"\\(?:smallskip|medskip|bigskip|noindent|hfill|hfil|vfill|vfil)\b")
+
 _PANDOC_FROM = "latex"
-_PANDOC_TO = "markdown+tex_math_dollars+pipe_tables-raw_tex"
+# Disabled table extensions: pandoc otherwise picks ``simple_tables`` for
+# header-less tables or ``multiline_tables`` for wide cells — neither is
+# recognised by Obsidian / GitHub / VS Code preview, which all render
+# them as preformatted text. Forcing only ``pipe_tables`` makes pandoc
+# fall back to raw HTML ``<table>`` for tables that don't fit pipe
+# format, and HTML tables do render in every viewer.
+_PANDOC_TO = (
+    "markdown"
+    "+tex_math_dollars"
+    "+pipe_tables"
+    "-raw_tex"
+    "-header_attributes"
+    "-link_attributes"
+    "-fenced_divs"
+    "-simple_tables"
+    "-multiline_tables"
+    "-grid_tables"
+)
 _PANDOC_FLAGS: tuple[str, ...] = (
     "--wrap=none",
     "--from=" + _PANDOC_FROM,
@@ -85,6 +205,9 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
     if work_dir is None:
         work_dir = Path(tempfile.mkdtemp(prefix="pandoc_"))
 
+    tex_content = _normalise_cite_args(tex_content)
+    tex_content = _strip_tex_spacing_commands(tex_content)
+
     tex_path = work_dir / "_pandoc_input.tex"
     tex_path.write_text(tex_content, encoding="utf-8")
 
@@ -110,5 +233,208 @@ def tex_to_markdown(tex_content: str, work_dir: Path | None = None) -> str:
         # Pandoc warns to stderr for unknown commands etc. — log at debug.
         logger.debug("pandoc stderr: %s", result.stderr.strip())
 
+    markdown = _strip_citation_at_signs(markdown)
+    markdown = _strip_pandoc_div_wrappers(markdown)
+    markdown = _strip_pandoc_crossrefs(markdown)
+    markdown = _convert_table_captions(markdown)
+    markdown = _rewrite_image_paths(markdown)
+    markdown = strip_math_labels(markdown)
+    markdown = isolate_display_math(markdown)
+
     logger.info("pandoc converted %d chars TeX → %d chars Markdown", len(tex_content), len(markdown))
     return markdown
+
+
+def _strip_tex_spacing_commands(tex: str) -> str:
+    """Strip low-level TeX spacing commands that pandoc rejects in body context.
+
+    Custom-typeset arXiv papers commonly use ``\\vskip 3em``, ``\\hskip``,
+    ``\\vspace{2em}`` etc. for visual layout. After we remove the
+    ``\\begin{abstract}...\\end{abstract}`` environment as part of
+    metadata rewriting, any ``\\vskip`` lines that surrounded the
+    abstract end up exposed at the top level of the document body.
+    pandoc's LaTeX reader then errors out (exit 64,
+    ``unexpected \\vskip``). These commands are purely typographic, so
+    removing them is safe.
+
+    Covers:
+      - ``\\vskip <length>`` / ``\\hskip`` / ``\\kern`` / ``\\lineskip``
+        (unbraced length argument like ``3em``)
+      - ``\\vspace{<length>}`` / ``\\hspace{<length>}`` (braced argument,
+        with optional ``*`` modifier)
+      - ``\\smallskip`` / ``\\medskip`` / ``\\bigskip``,
+        ``\\noindent``, ``\\hfill`` / ``\\vfill`` (no argument)
+    """
+    tex = _TEX_SKIP_LENGTH.sub("", tex)
+    tex = _TEX_SPACE_BRACED.sub("", tex)
+    tex = _TEX_SKIP_BARE.sub("", tex)
+    return tex
+
+
+def _normalise_cite_args(tex: str) -> str:
+    """Strip stray commas from ``\\cite{...}`` arguments.
+
+    LaTeX tolerates malformed citation lists such as ``\\cite{,Key}`` or
+    ``\\cite{A,,B}``; pandoc's strict parser aborts (exit 64,
+    ``unexpected ,``) and the whole pipeline fails. Common author typos
+    that we normalise:
+
+    * leading ``,``  — ``\\cite{,Key}``     → ``\\cite{Key}``
+    * trailing ``,`` — ``\\cite{Key,}``     → ``\\cite{Key}``
+    * doubled ``,``  — ``\\cite{A,,B}``     → ``\\cite{A,B}``
+    * whitespace      — ``\\cite{ A , B }`` → ``\\cite{A,B}``
+
+    Handles the whole ``cite`` family (``\\citep``, ``\\citet``,
+    ``\\citeyear``, etc.) including an optional ``[prenote]``/``[postnote]``
+    argument. Other commands and prose are untouched.
+    """
+
+    def _clean(match: re.Match[str]) -> str:
+        cmd = match.group(1)
+        optional_args = match.group(2) or ""
+        keys = [k.strip() for k in match.group(3).split(",") if k.strip()]
+        return f"\\{cmd}{optional_args}{{{','.join(keys)}}}"
+
+    return _CITE_FAMILY.sub(_clean, tex)
+
+
+def _convert_table_captions(markdown: str) -> str:
+    """Turn pandoc pipe-table captions (``: caption``) into ``**Table N:** ...``.
+
+    Pandoc places a pipe-table caption on a line of its own, starting with
+    ``: ``, immediately (with one blank line gap) after the table. Standard
+    Markdown viewers do not recognise this syntax — Obsidian / GitHub /
+    VS Code preview all show the literal ``: caption``. Convert each
+    such caption into a numbered, bold ``**Table N:** caption`` label so
+    it reads like the original paper's table caption.
+
+    Detection is intentionally conservative: a line is only treated as a
+    caption when the previous non-blank line is a pipe-table row (starts
+    AND ends with ``|``). Definition-list ``: definition`` constructs
+    that don't follow a table are left alone.
+    """
+    lines = markdown.split("\n")
+    out: list[str] = []
+    last_nonblank_was_pipe_row = False
+    table_count = 0
+    for line in lines:
+        stripped = line.strip()
+        if last_nonblank_was_pipe_row and stripped.startswith(": "):
+            table_count += 1
+            indent = line[: len(line) - len(line.lstrip())]
+            out.append(f"{indent}**Table {table_count}:** {stripped[2:]}")
+            last_nonblank_was_pipe_row = False
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            last_nonblank_was_pipe_row = True
+        elif stripped:
+            last_nonblank_was_pipe_row = False
+        out.append(line)
+    return "\n".join(out)
+
+
+def _strip_pandoc_div_wrappers(markdown: str) -> str:
+    """Remove ``<div class="figure*|center">`` wrappers, keeping inner content.
+
+    Pandoc emits a raw HTML ``<div>`` wrapping each figure environment when
+    ``fenced_divs`` is disabled. The class attribute carries information
+    pandoc itself uses for re-import but is invisible to standard Markdown
+    viewers, which still render the bare opener/closer tags as preformatted
+    text on their own lines.
+
+    We strip the openers we recognise and pop a matching ``</div>`` for
+    each one. Other ``<div>`` blocks (if the source somehow has them) are
+    left alone.
+    """
+    out: list[str] = []
+    pending_closes = 0
+    for line in markdown.split("\n"):
+        if _DIV_WRAPPER_OPEN.match(line.strip()):
+            pending_closes += 1
+            continue
+        if pending_closes > 0 and _DIV_CLOSE.match(line.strip()):
+            pending_closes -= 1
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _strip_pandoc_crossrefs(markdown: str) -> str:
+    """Replace ``<a data-reference-type="..." ...>text</a>`` with ``text``.
+
+    pandoc emits raw HTML anchors for ``\\ref{...}`` / ``\\eqref{...}``
+    with ``data-reference-type`` / ``data-reference`` attributes that
+    only its own re-import understands. Standard viewers print the full
+    ``<a ...>`` tag. The anchor target wouldn't resolve in Markdown
+    anyway (we don't emit ``id=""`` on headings), so the link adds no
+    value — keep the inner text.
+    """
+    return _PANDOC_CROSSREF.sub(lambda m: m.group(1), markdown)
+
+
+def _rewrite_image_paths(markdown: str) -> str:
+    """Point every image reference at ``images/<basename>.<renderable-ext>``.
+
+    Pandoc emits figure references as bare filenames (``![](name)``) or
+    raw HTML (``<img src="name">`` inside ``<figure>`` blocks). Neither
+    form lines up with our ZIP layout (figures shipped under ``images/``)
+    nor with what Obsidian / GitHub renders (PDF/EPS not supported inline).
+
+    This rewrites both shapes to ``images/<basename>.<ext>``, mapping
+    ``.pdf`` / ``.eps`` to ``.png`` (the conversion already done at
+    extraction time by ``image_convert.convert_pdf_figures_to_png``) and
+    stripping pandoc's trailing ``{width="3in"}`` attribute blocks, which
+    standard Markdown viewers print as visible noise. External URLs
+    (``http(s)://``, ``data:``) and already-correct ``images/`` paths
+    pass through unchanged.
+    """
+
+    def _md_replace(match: re.Match[str]) -> str:
+        return f"{match.group(1)}({_to_renderable_image_path(match.group(2))})"
+
+    def _html_replace(match: re.Match[str]) -> str:
+        attrs_before = match.group(1)
+        attrs_after = match.group(3)
+        new_src = _to_renderable_image_path(match.group(2))
+        return f'<img{attrs_before}src="{new_src}"{attrs_after} />'
+
+    markdown = _MD_IMAGE.sub(_md_replace, markdown)
+    markdown = _HTML_IMG_OR_EMBED.sub(_html_replace, markdown)
+    return markdown
+
+
+def _to_renderable_image_path(src: str) -> str:
+    """Map an image source token to ``images/<basename>.<renderable-ext>``."""
+    if src.startswith(("http://", "https://", "data:")):
+        return src
+    name = src.split("/")[-1]
+    if "." in name:
+        stem, _, ext = name.rpartition(".")
+        ext_lower = "." + ext.lower()
+        if ext_lower in _CONVERTED_TO_PNG_EXTS:
+            return f"images/{stem}.png"
+        if ext_lower in _RENDERABLE_EXTS:
+            return f"images/{stem}.{ext}"
+        # Unknown extension: leave as-is under images/ — better than guessing.
+        return f"images/{name}"
+    # No extension. Pandoc passes through ``\includegraphics{name}`` as-is.
+    # Assume our PDF→PNG conversion produced ``name.png``.
+    return f"images/{name}.png"
+
+
+def _strip_citation_at_signs(markdown: str) -> str:
+    """Convert pandoc citation tokens ``@key`` / ``[@key]`` into plain labels.
+
+    Pandoc's ``citations`` extension turns ``\\cite{Lin:1992}`` into the
+    Markdown token ``[@Lin:1992]`` and bare ``@Lin:1992`` for in-text
+    forms (``as @Lin:1992 showed``). Standard Markdown viewers do not
+    recognise either and render them verbatim. Disabling the extension
+    is not an alternative — pandoc then drops the citation entirely,
+    leaving dangling commas.
+
+    Stripping the ``@`` keeps the citation key visible as a label and
+    works in every renderer. The lookbehind in ``_CITATION_AT_SIGN``
+    protects email addresses (``her@example.com``) and any other ``@``
+    that is glued to a preceding identifier character.
+    """
+    return _CITATION_AT_SIGN.sub("", markdown)

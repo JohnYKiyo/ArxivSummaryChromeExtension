@@ -26,6 +26,8 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from src.tools.image_convert import convert_pdf_figures_to_png
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -44,6 +46,12 @@ _EPRINT_URL = "https://arxiv.org/e-print/{arxiv_id}"
 
 # Recognise ``\input{path}`` and ``\include{path}`` (no nesting).
 _INPUT_DIRECTIVE = re.compile(r"\\(?:input|include)\{([^{}]+)\}")
+
+# Recognise ``\bibliography{name}`` (single or comma-separated names) and
+# ``\bibliographystyle{...}``. The first is replaced with a .bbl include;
+# the second is stripped because pandoc doesn't use it.
+_BIBLIOGRAPHY_DIRECTIVE = re.compile(r"\\bibliography\{([^{}]+)\}")
+_BIBLIOGRAPHYSTYLE_DIRECTIVE = re.compile(r"\\bibliographystyle\{[^{}]*\}")
 
 # Max recursion depth for \input expansion (defensive — sane TeX trees
 # rarely nest more than 3 deep).
@@ -336,12 +344,21 @@ def _find_main_tex_file(tex_files: list[Path]) -> Path:
 
 
 def _expand_inputs(tex: str, base_dir: Path, depth: int = 0, seen: set[Path] | None = None) -> str:
-    """Inline ``\\input{...}`` and ``\\include{...}`` directives.
+    """Inline ``\\input{...}``, ``\\include{...}`` and ``\\bibliography{...}`` directives.
 
-    Looks for each referenced file relative to ``base_dir``, trying both
-    the literal path and the path with a ``.tex`` extension appended.
-    Cycles are broken by tracking already-included files. Unresolved
-    directives are left as-is so the LLM can see something is missing.
+    For ``\\input`` / ``\\include``: looks for each referenced file relative to
+    ``base_dir``, trying both the literal path and the path with a ``.tex``
+    extension appended. Cycles are broken by tracking already-included files.
+    Unresolved directives are left as-is.
+
+    For ``\\bibliography{name}``: arXiv submissions usually ship a pre-built
+    ``<name>.bbl`` (BibTeX output containing ``\\thebibliography`` /
+    ``\\bibitem``). We inline that .bbl in place of the directive, preceded by
+    ``\\section*{References}`` so pandoc emits a proper References heading.
+    Falls back to any ``*.bbl`` in the source tree when the named one is
+    missing (most arXiv tarballs contain exactly one .bbl).
+
+    ``\\bibliographystyle{...}`` is stripped — pandoc doesn't need it.
 
     Args:
         tex: The TeX content to scan.
@@ -365,7 +382,7 @@ def _expand_inputs(tex: str, base_dir: Path, depth: int = 0, seen: set[Path] | N
                 return candidate.resolve()
         return None
 
-    def _replace(match: re.Match[str]) -> str:
+    def _replace_input(match: re.Match[str]) -> str:
         path = _resolve(match.group(1))
         if path is None:
             return match.group(0)
@@ -375,7 +392,306 @@ def _expand_inputs(tex: str, base_dir: Path, depth: int = 0, seen: set[Path] | N
         inner = path.read_text(encoding="utf-8", errors="replace")
         return _expand_inputs(inner, path.parent, depth + 1, seen)
 
-    return _INPUT_DIRECTIVE.sub(_replace, tex)
+    tex = _INPUT_DIRECTIVE.sub(_replace_input, tex)
+
+    # \bibliographystyle isn't needed by pandoc; drop it everywhere.
+    tex = _BIBLIOGRAPHYSTYLE_DIRECTIVE.sub("", tex)
+
+    def _replace_bibliography(match: re.Match[str]) -> str:
+        names = [n.strip() for n in match.group(1).split(",") if n.strip()]
+        bbl_path: Path | None = None
+        for name in names:
+            candidates = list(base_dir.rglob(f"{name}.bbl"))
+            if candidates:
+                bbl_path = candidates[0]
+                break
+        if bbl_path is None:
+            # Common case: only one .bbl in the tarball; use it regardless of name.
+            any_bbl = list(base_dir.rglob("*.bbl"))
+            if any_bbl:
+                bbl_path = any_bbl[0]
+        if bbl_path is None:
+            logger.warning(
+                "No .bbl found for \\bibliography{%s}; references will be missing",
+                match.group(1),
+            )
+            return match.group(0)
+        if bbl_path in seen:
+            return ""
+        seen.add(bbl_path)
+        bbl_content = bbl_path.read_text(encoding="utf-8", errors="replace")
+        expanded_bbl = _expand_inputs(bbl_content, bbl_path.parent, depth + 1, seen)
+        return "\\section*{References}\n" + expanded_bbl
+
+    tex = _BIBLIOGRAPHY_DIRECTIVE.sub(_replace_bibliography, tex)
+    return tex
+
+
+def _match_balanced_brace(text: str, open_pos: int) -> int:
+    """Given the index of an opening ``{`` in *text*, return the index of the matching ``}``.
+
+    Honours TeX-style escaping: ``\\{`` and ``\\}`` are treated as literal
+    characters, not brace delimiters. Raises ``ValueError`` if no balanced
+    closing brace exists.
+    """
+    if open_pos >= len(text) or text[open_pos] != "{":
+        raise ValueError(f"No '{{' at position {open_pos}")
+    depth = 1
+    i = open_pos + 1
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            i += 2  # skip escaped character (\{, \}, \\, etc.)
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise ValueError("Unbalanced braces")
+
+
+def _find_command_inner(tex: str, command: str) -> str | None:
+    """Return the contents of the first ``\\command{...}`` in *tex*, or ``None``."""
+    pattern = re.compile(r"\\" + re.escape(command) + r"\s*\{")
+    m = pattern.search(tex)
+    if not m:
+        return None
+    try:
+        close = _match_balanced_brace(tex, m.end() - 1)
+    except ValueError:
+        return None
+    return tex[m.end() : close]
+
+
+def _strip_command(tex: str, command: str) -> str:
+    """Remove every ``\\command{...}`` occurrence from *tex* (balanced braces)."""
+    pattern = re.compile(r"\\" + re.escape(command) + r"\s*\{")
+    out: list[str] = []
+    last = 0
+    for m in pattern.finditer(tex):
+        try:
+            close = _match_balanced_brace(tex, m.end() - 1)
+        except ValueError:
+            continue
+        out.append(tex[last : m.start()])
+        last = close + 1
+    out.append(tex[last:])
+    return "".join(out)
+
+
+def _strip_two_arg_command(tex: str, command: str) -> str:
+    """Remove every ``\\command{X}{Y}`` from *tex* (non-nested arguments).
+
+    The ICML template uses two-argument helpers like ``\\icmlauthor{Name}{aff}``
+    and ``\\icmlaffiliation{key}{Institution}``. The single-argument
+    :func:`_strip_command` would leave the second brace pair orphaned.
+    """
+    pattern = re.compile(r"\\" + re.escape(command) + r"\s*\{[^{}]*\}\s*\{[^{}]*\}")
+    return pattern.sub("", tex)
+
+
+_ICML_AUTHOR_RE = re.compile(r"\\icmlauthor\s*\{([^{}]+)\}\s*\{[^{}]*\}")
+_ICML_AFFILIATION_RE = re.compile(r"\\icmlaffiliation\s*\{[^{}]*\}\s*\{([^{}]+)\}")
+
+
+def _icml_authors_joined(tex: str) -> str | None:
+    """Join names from every ``\\icmlauthor{Name}{aff}`` with ``\\and``.
+
+    Returns ``None`` if no ``\\icmlauthor`` appears. The result is fed
+    through :func:`_clean_author_list`, which already handles the
+    ``\\and`` separator, so downstream callers see the same author list
+    shape as the standard ``\\author`` path.
+    """
+    names = [m.group(1).strip() for m in _ICML_AUTHOR_RE.finditer(tex)]
+    if not names:
+        return None
+    return r" \and ".join(names)
+
+
+def _icml_affiliations_joined(tex: str) -> str | None:
+    """Collect institution names from every ``\\icmlaffiliation{key}{Name}``.
+
+    Duplicate institutions are folded to a single entry (in source order)
+    so the comma-separated list reads naturally. Returns ``None`` if no
+    ``\\icmlaffiliation`` appears.
+    """
+    seen: set[str] = set()
+    unique: list[str] = []
+    for match in _ICML_AFFILIATION_RE.finditer(tex):
+        name = match.group(1).strip()
+        if name and name not in seen:
+            seen.add(name)
+            unique.append(name)
+    if not unique:
+        return None
+    return ", ".join(unique)
+
+
+def _find_environment_body(tex: str, env: str) -> str | None:
+    """Return the body of the first ``\\begin{env}...\\end{env}`` block, or ``None``."""
+    begin = re.search(r"\\begin\{" + re.escape(env) + r"\}", tex)
+    if not begin:
+        return None
+    end = re.search(r"\\end\{" + re.escape(env) + r"\}", tex[begin.end() :])
+    if not end:
+        return None
+    return tex[begin.end() : begin.end() + end.start()]
+
+
+def _strip_environment(tex: str, env: str) -> str:
+    """Remove every ``\\begin{env}...\\end{env}`` block from *tex* (non-nested)."""
+    pattern = re.compile(
+        r"\\begin\{" + re.escape(env) + r"\}.*?\\end\{" + re.escape(env) + r"\}",
+        re.DOTALL,
+    )
+    return pattern.sub("", tex)
+
+
+def _strip_tex_line_comments(tex: str) -> str:
+    """Remove TeX ``%`` line-comments (``%`` to end of line).
+
+    Author / title templates commonly use the ``%\\n`` line-continuation
+    idiom (``Name%\\n\\\\\\nAffiliation%\\n``) so paragraphs join without
+    intervening space. Once we collapse whitespace for downstream
+    consumption the ``%`` would extend its comment to the rest of the
+    collapsed line (i.e. the entire input), accidentally swallowing
+    everything that follows it inside ``\\section*{}`` / ``\\textit{}``.
+    Strip the comment portion explicitly before any whitespace work.
+    """
+    return re.sub(r"%[^\n]*", "", tex)
+
+
+def _clean_title(title: str) -> str:
+    """Normalise a TeX ``\\title{}`` payload for inclusion in ``\\section*{}``.
+
+    Authors sometimes attach ``\\thanks{...}`` (a footnote command meant
+    for ``\\maketitle``) directly to the title text. Embedding that
+    inside ``\\section*{...}`` is ill-formed for pandoc — the multi-line
+    ``\\thanks{}`` body containing parentheses and special punctuation
+    trips pandoc's parser. Strip ``\\thanks{...}`` plus TeX line
+    comments and collapse whitespace so the resulting heading is just
+    the bare title text.
+    """
+    cleaned = _strip_tex_line_comments(title)
+    cleaned = _strip_command(cleaned, "thanks")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _clean_author_list(authors: str) -> str:
+    """Normalise a TeX ``\\author{}`` payload into a comma-separated string.
+
+    - Drops TeX ``%`` line comments (common ``%\\n`` continuation idiom).
+    - Strips ``\\thanks{...}`` blocks (affiliations / emails attached per author).
+    - Replaces ``\\and`` and ``\\\\`` separators with commas.
+    - Collapses whitespace and dedupes adjacent commas.
+    """
+    cleaned = _strip_tex_line_comments(authors)
+    cleaned = _strip_command(cleaned, "thanks")
+    cleaned = re.sub(r"\\and\b", ",", cleaned)
+    cleaned = re.sub(r"\\\\", ",", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
+    return cleaned.strip(", ").strip()
+
+
+def _extract_metadata_and_rewrite(tex: str) -> str:
+    """Rewrite ``\\title`` / ``\\author`` / ``\\maketitle`` / abstract env as explicit sections.
+
+    Pandoc invoked without ``--standalone`` discards ``\\title`` / ``\\author``
+    / ``\\begin{abstract}`` metadata when writing Markdown. To preserve them
+    we substitute the title-block machinery with plain ``\\section*`` blocks
+    that pandoc will emit as Markdown headings.
+
+    Recognises the standard LaTeX shape and the ICML conference template:
+
+      - Title: ``\\title{...}``  or  ``\\icmltitle{...}``
+      - Authors: ``\\author{...}``  or  one-or-more ``\\icmlauthor{Name}{aff}``
+      - Abstract: ``\\begin{abstract}...\\end{abstract}``
+
+    Behaviour:
+      - title → ``\\section*{title-content}`` (replacing ``\\maketitle``,
+        or inserted right after ``\\begin{document}`` if no ``\\maketitle``).
+      - authors → ``\\textit{authors}`` where ``\\and`` / ``\\\\`` become
+        commas and ``\\thanks{...}`` is stripped.
+      - abstract body → preceded by ``\\section*{Abstract}``.
+
+    Missing pieces are skipped silently. Math and inline commands inside
+    title / abstract stay in TeX form so pandoc renders them on the
+    subsequent conversion pass.
+    """
+    title_inner = _find_command_inner(tex, "title") or _find_command_inner(tex, "icmltitle")
+    author_inner = _find_command_inner(tex, "author") or _icml_authors_joined(tex)
+    abstract_body = _find_environment_body(tex, "abstract")
+
+    if title_inner is None and abstract_body is None:
+        return tex
+
+    block_parts: list[str] = []
+    if title_inner is not None:
+        block_parts.append("\\section*{" + _clean_title(title_inner) + "}")
+    if author_inner is not None:
+        authors = _clean_author_list(author_inner)
+        if authors:
+            block_parts.append("\\textit{" + authors + "}")
+    # ICML papers separate affiliations into ``\icmlaffiliation{key}{Name}``
+    # entries that we'd otherwise strip and lose. Surface them as their own
+    # ``\textit{}`` line so the summary agent and the translated Markdown
+    # both have the institution information.
+    affiliations = _icml_affiliations_joined(tex)
+    if affiliations:
+        block_parts.append("\\textit{" + affiliations + "}")
+    if abstract_body is not None:
+        block_parts.append("\\section*{Abstract}\n" + abstract_body.strip())
+
+    title_block = "\n\n".join(block_parts) + "\n"
+
+    # Remove the originals so they don't render twice (and so pandoc
+    # doesn't emit raw_tex noise for the ICML-specific helpers).
+    result = _strip_command(tex, "title")
+    result = _strip_command(result, "icmltitle")
+    result = _strip_command(result, "icmltitlerunning")
+    result = _strip_command(result, "icmlkeywords")
+    result = _strip_command(result, "author")
+    result = _strip_environment(result, "abstract")
+    # ICML's two-argument helpers — pandoc/-raw_tex drops them but stripping
+    # explicitly keeps the input pandoc sees clean.
+    for two_arg_cmd in (
+        "icmlauthor",
+        "icmlaffiliation",
+        "icmlcorrespondingauthor",
+        "icmlsetsymbol",
+    ):
+        result = _strip_two_arg_command(result, two_arg_cmd)
+
+    # Replace only ``\maketitle`` invocations, not occurrences inside
+    # ``\renewcommand{\maketitle}{...}`` (where ``\maketitle`` is followed
+    # by ``}``) nor longer command names beginning with ``maketitle``.
+    # The bare ``str.replace`` we used previously hit the first textual
+    # match — which on papers that redefine ``\maketitle`` was inside the
+    # ``\renewcommand`` brace, producing ``\renewcommand{\section*{...}``
+    # and crashing pandoc.
+    maketitle_invocation = re.compile(r"\\maketitle(?![a-zA-Z}])")
+    if maketitle_invocation.search(result):
+        result = maketitle_invocation.sub(lambda _m: title_block, result, count=1)
+    else:
+        doc_begin = re.search(r"\\begin\{document\}", result)
+        if doc_begin:
+            insert_at = doc_begin.end()
+            result = result[:insert_at] + "\n\n" + title_block + result[insert_at:]
+        else:
+            result = title_block + result
+
+    logger.info(
+        "Rewrote title/author/abstract as explicit sections (title=%s, authors=%s, abstract=%s)",
+        title_inner is not None,
+        author_inner is not None,
+        abstract_body is not None,
+    )
+    return result
 
 
 def extract_source(tar_path: Path, output_dir: Path) -> tuple[str, list[Path]]:
@@ -417,6 +733,7 @@ def extract_source(tar_path: Path, output_dir: Path) -> tuple[str, list[Path]]:
     main_tex = _find_main_tex_file(tex_files)
     raw_content = main_tex.read_text(encoding="utf-8", errors="replace")
     expanded = _expand_inputs(raw_content, main_tex.parent)
+    expanded = _extract_metadata_and_rewrite(expanded)
 
     # Some submissions are TeX wrappers that just embed a PDF. There is no
     # actual text to translate, so surface this as a PDF-only paper.
@@ -442,17 +759,26 @@ def extract_source(tar_path: Path, output_dir: Path) -> tuple[str, list[Path]]:
 
 
 def fetch_arxiv_paper(url: str) -> PaperSource:
-    """Fetch an arXiv paper, preferring HTML over TeX source.
+    """Fetch an arXiv paper via the TeX e-print archive.
 
-    Tries the HTML version first (``arxiv.org/html/<id>``); if unavailable,
-    falls back to the e-print TeX archive. Raises :class:`PdfOnlyPaperError`
-    for PDF-only papers.
+    Previously this preferred LaTeXML's HTML rendering, but in practice
+    LaTeXML's output for many papers contains preamble leakage
+    (``\\NewDocumentCommand``, ``\\makesavenoteenv``), ``\\citeproc``
+    citation residue, ``\\thanks`` inlined into titles, and emails
+    resolved as relative URLs — none of which the HTML path's
+    post-processing reliably catches. The TeX path through pandoc, with
+    the post-processors in ``tex_to_markdown``, produces a noticeably
+    cleaner Markdown.
+
+    Raises :class:`PdfOnlyPaperError` for PDF-only papers (no TeX
+    source available).
 
     Args:
         url: An arXiv URL or bare arXiv paper ID.
 
     Returns:
-        A :class:`PaperSource` describing the fetched content.
+        A :class:`PaperSource` describing the fetched content (always
+        ``kind="tex"``).
 
     Raises:
         ValueError: If ``url`` is not a recognisable arXiv reference.
@@ -464,30 +790,17 @@ def fetch_arxiv_paper(url: str) -> PaperSource:
     work_dir = Path(tempfile.mkdtemp(prefix=f"arxiv_{arxiv_id}_"))
     logger.info("Working directory: %s", work_dir)
 
-    # 1. Try the HTML version first.
-    html_result = try_fetch_html(arxiv_id)
-    if html_result is not None:
-        html, final_url = html_result
-        # final_url is the post-redirect page URL (e.g. .../1706.03762v7);
-        # urljoin treats its last path component as a "filename" and uses
-        # the parent for relative resolution, which is exactly the browser
-        # rule we need for ``<img src="1706.03762v7/Figures/X.png">``.
-        images_dir = work_dir / "html_images"
-        rewritten_html, image_paths = _download_html_images(html, final_url, images_dir)
-        return PaperSource(
-            kind="html",
-            content=rewritten_html,
-            work_dir=work_dir,
-            arxiv_id=arxiv_id,
-            images=image_paths,
-        )
-
-    # 2. Fall back to the TeX e-print source.
     source_path = download_arxiv_source(arxiv_id, work_dir)
     extract_dir = work_dir / "source"
     extract_dir.mkdir(exist_ok=True)
 
     tex_content, image_paths = extract_source(source_path, extract_dir)
+    # Rasterise PDF figures to PNG so the eventual Markdown is renderable in
+    # Obsidian / GitHub / VS Code preview (none of which display PDFs
+    # inline). Done here, before pandoc, so pandoc's figure-file lookup
+    # against the extract directory finds the PNG when resolving
+    # ``\includegraphics{name}``.
+    image_paths = convert_pdf_figures_to_png(image_paths)
     return PaperSource(
         kind="tex",
         content=tex_content,
