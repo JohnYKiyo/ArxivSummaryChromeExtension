@@ -631,12 +631,20 @@ def _clean_author_list(authors: str) -> str:
     - Drops TeX ``%`` line comments (common ``%\\n`` continuation idiom).
     - Strips ``\\thanks{...}`` blocks (affiliations / emails attached per author).
     - Replaces ``\\and`` and ``\\\\`` separators with commas.
+    - Drops TeX "control space" sequences (``\\`` immediately followed by
+      whitespace). ICLR-style author blocks end each name line with a
+      lone ``\\`` for visual spacing; if any survive into the wrapping
+      ``\\textit{...}`` they form ``\\}`` — an escaped literal ``}``
+      that does *not* close the ``\\textit{`` group, so pandoc reads
+      past it and fails downstream (e.g. arXiv 2605.05242, where pandoc
+      aborted with ``unexpected ()`` at the next ``\\section*``).
     - Collapses whitespace and dedupes adjacent commas.
     """
     cleaned = _strip_tex_line_comments(authors)
     cleaned = _strip_command(cleaned, "thanks")
     cleaned = re.sub(r"\\and\b", ",", cleaned)
     cleaned = re.sub(r"\\\\", ",", cleaned)
+    cleaned = re.sub(r"\\(?=\s)", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
     return cleaned.strip(", ").strip()
