@@ -99,9 +99,7 @@ def create_summary_agent(model: str, *, api_key: str | None = None) -> LlmAgent:
     Returns:
         A configured :class:`LlmAgent` with the template-loading tool.
     """
-    llm: str | ScopedKeyGemini = (
-        ScopedKeyGemini(model=model, api_key=api_key) if api_key else model
-    )
+    llm: str | ScopedKeyGemini = ScopedKeyGemini(model=model, api_key=api_key) if api_key else model
     return LlmAgent(
         name="SummaryAgent",
         model=llm,

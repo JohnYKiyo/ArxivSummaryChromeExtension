@@ -91,9 +91,7 @@ def create_translation_agent(model: str, *, api_key: str | None = None) -> LlmAg
         A configured :class:`LlmAgent` with the model's maximum output
         token budget allocated so long papers translate without truncation.
     """
-    llm: str | ScopedKeyGemini = (
-        ScopedKeyGemini(model=model, api_key=api_key) if api_key else model
-    )
+    llm: str | ScopedKeyGemini = ScopedKeyGemini(model=model, api_key=api_key) if api_key else model
     return LlmAgent(
         name="TranslationAgent",
         model=llm,
