@@ -489,9 +489,7 @@ def _strip_two_arg_command(tex: str, command: str) -> str:
     and ``\\icmlaffiliation{key}{Institution}``. The single-argument
     :func:`_strip_command` would leave the second brace pair orphaned.
     """
-    pattern = re.compile(
-        r"\\" + re.escape(command) + r"\s*\{[^{}]*\}\s*\{[^{}]*\}"
-    )
+    pattern = re.compile(r"\\" + re.escape(command) + r"\s*\{[^{}]*\}\s*\{[^{}]*\}")
     return pattern.sub("", tex)
 
 
