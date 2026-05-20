@@ -20,7 +20,11 @@ class Settings(BaseSettings):
     )
 
     # LLM
-    GOOGLE_API_KEY: str
+    # Optional: the Chrome extension supplies the key per-request via the
+    # ``X-Google-Api-Key`` header (see ``api/routes.create_conversion``),
+    # so the server can boot without one. Web UI requests still rely on
+    # this env value, so omitting it disables the web flow.
+    GOOGLE_API_KEY: str = ""
     LLM_MODEL: str = "gemini-2.5-pro-preview-05-06"
 
     # AWS / Cognito

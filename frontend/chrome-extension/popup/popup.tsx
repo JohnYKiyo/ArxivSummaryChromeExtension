@@ -15,8 +15,10 @@ const POLL_INTERVAL_MS = 3000;
 
 // ── Types ───────────────────────────────────────────────
 
-interface ConvertResponse {
-  job_id: string;
+interface StartConversionResponse {
+  success: boolean;
+  jobId?: string;
+  error?: string;
 }
 
 interface StatusResponse {
@@ -50,6 +52,7 @@ const retryBtn = $<HTMLButtonElement>("retry-btn");
 const settingsToggle = $<HTMLButtonElement>("settings-toggle");
 const settingsPanel = $<HTMLDivElement>("settings-panel");
 const apiUrlInput = $<HTMLInputElement>("api-url");
+const apiKeyInput = $<HTMLInputElement>("api-key");
 const saveSettingsBtn = $<HTMLButtonElement>("save-settings");
 
 // ── State ───────────────────────────────────────────────
@@ -57,6 +60,11 @@ const saveSettingsBtn = $<HTMLButtonElement>("save-settings");
 let currentJobId: string | null = null;
 let pollingInterval: ReturnType<typeof setInterval> | null = null;
 let apiBaseUrl: string = DEFAULT_API_URL;
+// Google API key supplied by the user via the settings panel. The Chrome
+// extension does NOT inherit the backend's .env credential — translations
+// can only start when this is non-empty. Sent on every /convert call as the
+// ``X-Google-Api-Key`` header.
+let googleApiKey: string = "";
 
 // ── Helpers ─────────────────────────────────────────────
 
@@ -76,8 +84,8 @@ function resetUI(): void {
   hide(progressSection);
   hide(downloadSection);
   hide(errorSection);
-  submitBtn.disabled = false;
   submitBtn.textContent = "翻訳を開始";
+  updateSubmitEnabled();
   progressBar.style.width = "0%";
   progressPercent.textContent = "0%";
   progressStep.textContent = "";
@@ -87,8 +95,8 @@ function showError(msg: string): void {
   errorMessage.textContent = msg;
   show(errorSection);
   hide(progressSection);
-  submitBtn.disabled = false;
   submitBtn.textContent = "翻訳を開始";
+  updateSubmitEnabled();
 }
 
 function stopPolling(): void {
@@ -125,20 +133,31 @@ async function getApiUrl(): Promise<string> {
   });
 }
 
-async function submitConversion(arxivUrl: string): Promise<ConvertResponse> {
-  const url = `${apiBaseUrl}/api/v1/convert`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ arxiv_url: arxivUrl }),
+async function getStoredApiKey(): Promise<string> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(["googleApiKey"], (result) => {
+      resolve(typeof result.googleApiKey === "string" ? result.googleApiKey : "");
+    });
   });
+}
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`API error (${res.status}): ${text}`);
-  }
-
-  return res.json();
+/** Ask the service worker to start a conversion.
+ *
+ * Routing through the SW (instead of fetching ``/convert`` from the
+ * popup) is what lets the popup recover from being closed: the SW owns
+ * the in-flight ``activeJob`` and persists it to ``chrome.storage.local``,
+ * so a later popup reopen — even after the SW itself was idle-killed and
+ * respawned — can restore the progress / download-button UI via
+ * ``GET_STATUS``. A direct popup-to-backend fetch leaves the SW unaware
+ * of the job, so when the popup closes its state is gone for good.
+ */
+async function startConversionViaServiceWorker(
+  arxivUrl: string
+): Promise<StartConversionResponse> {
+  return (await chrome.runtime.sendMessage({
+    type: "START_CONVERSION",
+    arxivUrl,
+  })) as StartConversionResponse;
 }
 
 /** Start polling GET /status for the given job every POLL_INTERVAL_MS ms. */
@@ -213,8 +232,8 @@ function onConversionComplete(jobId: string, downloadUrl: string | null): void {
   progressStep.textContent = "翻訳が完了しました";
 
   show(downloadSection);
-  submitBtn.disabled = false;
   submitBtn.textContent = "翻訳を開始";
+  updateSubmitEnabled();
 
   chrome.runtime.sendMessage({
     type: "UPDATE_BADGE",
@@ -241,6 +260,15 @@ async function handleSubmit(): Promise<void> {
     showError("有効なarXiv URLを入力してください");
     return;
   }
+  // The extension's whole credential model is "user supplies their own
+  // key" — block here rather than letting the request hit the backend with
+  // an empty header.
+  if (!googleApiKey) {
+    showError("設定から Google API Key を入力してください");
+    settingsPanel.classList.remove("hidden");
+    apiKeyInput.focus();
+    return;
+  }
 
   resetUI();
   submitBtn.disabled = true;
@@ -249,8 +277,15 @@ async function handleSubmit(): Promise<void> {
   hide(errorSection);
 
   try {
-    const response = await submitConversion(arxivUrl);
-    currentJobId = response.job_id;
+    const response = await startConversionViaServiceWorker(arxivUrl);
+    if (!response?.success || !response.jobId) {
+      showError(response?.error || "翻訳の開始に失敗しました");
+      return;
+    }
+    currentJobId = response.jobId;
+    // The SW is already polling this job from its own context — the popup
+    // also polls so the open UI updates in real time. The SW's polling
+    // is what keeps state alive across popup close / SW idle-kill.
     startPolling(currentJobId);
   } catch (err) {
     const message = err instanceof Error ? err.message : "不明なエラー";
@@ -261,26 +296,40 @@ async function handleSubmit(): Promise<void> {
 function handleUrlInput(): void {
   const value = urlInput.value.trim();
   if (value && isArxivUrl(value)) {
-    submitBtn.disabled = false;
-    urlHint.textContent = "有効なarXiv URLです";
+    urlHint.textContent = googleApiKey
+      ? "有効なarXiv URLです"
+      : "有効なarXiv URLです (設定から API Key を入力してください)";
     urlHint.classList.add("detected");
   } else if (value) {
-    submitBtn.disabled = true;
     urlHint.textContent = "arXiv URLの形式で入力してください";
     urlHint.classList.remove("detected");
   } else {
-    submitBtn.disabled = true;
     urlHint.textContent = "";
     urlHint.classList.remove("detected");
   }
+  updateSubmitEnabled();
+}
+
+/** Enable the submit button only when both URL is valid and API key is set. */
+function updateSubmitEnabled(): void {
+  const value = urlInput.value.trim();
+  submitBtn.disabled = !(value && isArxivUrl(value) && googleApiKey);
 }
 
 // ── Initialization ──────────────────────────────────────
 
 async function init(): Promise<void> {
-  // Load saved API URL
+  // Load saved API URL and API key
   apiBaseUrl = await getApiUrl();
   apiUrlInput.value = apiBaseUrl;
+  googleApiKey = await getStoredApiKey();
+  apiKeyInput.value = googleApiKey;
+
+  // If the user has never entered a key, surface the settings panel up-front
+  // so the requirement is obvious instead of failing silently at submit time.
+  if (!googleApiKey) {
+    settingsPanel.classList.remove("hidden");
+  }
 
   // Try to auto-fill from the current tab
   try {
@@ -290,46 +339,57 @@ async function init(): Promise<void> {
     });
     if (tab?.url && isArxivUrl(tab.url)) {
       urlInput.value = tab.url;
-      urlHint.textContent = "現在のタブから検出しました";
+      urlHint.textContent = googleApiKey
+        ? "現在のタブから検出しました"
+        : "現在のタブから検出しました (設定から API Key を入力してください)";
       urlHint.classList.add("detected");
-      submitBtn.disabled = false;
     }
   } catch {
     // Not in a context where we can query tabs; ignore
   }
+  updateSubmitEnabled();
 
-  // Restore the active job from the background service worker so closing
-  // and reopening the popup does not lose in-progress, completed, or errored
-  // jobs. The SW persists activeJob to chrome.storage.local, so this works
-  // even if the worker was killed between popup opens.
-  try {
-    const response = await chrome.runtime.sendMessage({ type: "GET_STATUS" });
-    if (response?.jobId) {
-      const restoredJobId: string = response.jobId;
-      currentJobId = restoredJobId;
-      if (response.arxivUrl) {
-        urlInput.value = response.arxivUrl;
-        urlHint.textContent = "前回の翻訳ジョブを復元しました";
-        urlHint.classList.add("detected");
-      }
+  // Restore the active job for the current tab's URL. The SW tracks
+  // jobs per-URL, so a popup opened on tab A sees A's translation
+  // status independently of any other tab also running its own
+  // translation. ``GET_STATUS`` returns ``null`` when the active tab's
+  // URL has no associated job (fresh UI).
+  //
+  // Limitation: if the user manually pasted some other arxiv URL into a
+  // different tab and submitted, then came back to a tab whose URL
+  // doesn't match anything in the SW table, the popup shows fresh UI.
+  // Submission key = the tab's URL is the easiest mental model; the
+  // alternative (track "last submitted from this popup") would mask
+  // the per-tab behaviour the user actually wants.
+  const lookupUrl = urlInput.value.trim();
+  if (lookupUrl && isArxivUrl(lookupUrl)) {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "GET_STATUS",
+        arxivUrl: lookupUrl,
+      });
+      if (response?.jobId) {
+        const restoredJobId: string = response.jobId;
+        currentJobId = restoredJobId;
 
-      if (response.status === "processing") {
-        submitBtn.disabled = true;
-        submitBtn.textContent = "処理中...";
-        show(progressSection);
-        const pct: number = response.progress ?? 0;
-        progressBar.style.width = `${pct}%`;
-        progressPercent.textContent = `${pct}%`;
-        startPolling(restoredJobId);
-      } else if (response.status === "complete") {
-        show(progressSection);
-        onConversionComplete(restoredJobId, response.downloadUrl ?? null);
-      } else if (response.status === "error") {
-        showError(response.error || "変換中にエラーが発生しました");
+        if (response.status === "processing") {
+          submitBtn.disabled = true;
+          submitBtn.textContent = "処理中...";
+          show(progressSection);
+          const pct: number = response.progress ?? 0;
+          progressBar.style.width = `${pct}%`;
+          progressPercent.textContent = `${pct}%`;
+          startPolling(restoredJobId);
+        } else if (response.status === "complete") {
+          show(progressSection);
+          onConversionComplete(restoredJobId, response.downloadUrl ?? null);
+        } else if (response.status === "error") {
+          showError(response.error || "変換中にエラーが発生しました");
+        }
       }
+    } catch {
+      // No active job for this URL — fresh UI.
     }
-  } catch {
-    // No active job
   }
 
   // Event listeners
@@ -346,9 +406,19 @@ async function init(): Promise<void> {
 
   saveSettingsBtn.addEventListener("click", async () => {
     const newUrl = apiUrlInput.value.trim().replace(/\/+$/, "");
+    const newKey = apiKeyInput.value.trim();
+    const updates: Record<string, string> = {};
     if (newUrl) {
       apiBaseUrl = newUrl;
-      await chrome.storage.local.set({ apiUrl: newUrl });
+      updates.apiUrl = newUrl;
+    }
+    // Always persist the key (including the empty string) so the user can
+    // explicitly clear it from the UI.
+    googleApiKey = newKey;
+    updates.googleApiKey = newKey;
+    await chrome.storage.local.set(updates);
+    updateSubmitEnabled();
+    if (newKey) {
       settingsPanel.classList.add("hidden");
     }
   });

@@ -16,7 +16,11 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Lambda handler for the pipeline runner.
 
     Args:
-        event: Dict with ``job_id`` and ``arxiv_url`` keys.
+        event: Dict with ``job_id``, ``arxiv_url`` and optionally
+            ``api_key`` keys. ``api_key`` is forwarded from the API
+            Lambda when the originating client (Chrome extension)
+            supplied an ``X-Google-Api-Key`` header; absent for the
+            web UI, which relies on the Lambda's env var.
         context: Lambda context (unused).
 
     Returns:
@@ -24,6 +28,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """
     job_id = event["job_id"]
     arxiv_url = event["arxiv_url"]
+    api_key: str | None = event.get("api_key") or None
 
     logger.info("Pipeline Lambda invoked for job %s: %s", job_id, arxiv_url)
 
@@ -52,6 +57,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 arxiv_url=arxiv_url,
                 job_id=job_id,
                 job_manager=job_manager,
+                api_key=api_key,
             )
         )
         logger.info("Pipeline Lambda completed for job %s", job_id)

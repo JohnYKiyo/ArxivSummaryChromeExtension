@@ -10,6 +10,7 @@ from pathlib import Path
 
 from google.adk.agents import LlmAgent
 
+from src.agents._llm import ScopedKeyGemini
 from src.config import get_settings
 
 
@@ -81,7 +82,7 @@ Do not wrap the output in a code fence.
 """
 
 
-def create_summary_agent(model: str) -> LlmAgent:
+def create_summary_agent(model: str, *, api_key: str | None = None) -> LlmAgent:
     """Create a SummaryAgent that classifies and summarises papers.
 
     The agent uses a function tool to load the correct template based on
@@ -89,13 +90,21 @@ def create_summary_agent(model: str) -> LlmAgent:
 
     Args:
         model: The LLM model identifier.
+        api_key: Optional caller-supplied Google API key. When provided,
+            wraps the model in :class:`ScopedKeyGemini` so the underlying
+            ``genai.Client`` is bound to this key (bypasses
+            ``GOOGLE_API_KEY`` env). Falls back to env-based auth when
+            omitted.
 
     Returns:
         A configured :class:`LlmAgent` with the template-loading tool.
     """
+    llm: str | ScopedKeyGemini = (
+        ScopedKeyGemini(model=model, api_key=api_key) if api_key else model
+    )
     return LlmAgent(
         name="SummaryAgent",
-        model=model,
+        model=llm,
         instruction=_SUMMARY_INSTRUCTION,
         description=(
             "Classifies a paper as regular or review/survey, loads the "
