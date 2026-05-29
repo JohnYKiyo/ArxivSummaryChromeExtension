@@ -139,7 +139,7 @@ npm install && npm run build      # dist/ にバンドル出力
 npm run watch                      # 開発中の自動リビルド
 
 # Infrastructure (AWS CDK)
-cd infrastructure
+cd infrastructure/cdk
 pip install -r requirements.txt
 cdk synth && cdk deploy --all
 ```

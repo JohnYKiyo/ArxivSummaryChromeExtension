@@ -73,7 +73,7 @@ Load `frontend/chrome-extension/dist/` as an unpacked extension in `chrome://ext
 
 ### Infrastructure (AWS CDK, Python)
 ```bash
-cd infrastructure
+cd infrastructure/cdk
 pip install -r requirements.txt
 cdk synth                    # generate CloudFormation
 cdk deploy --all             # deploy all stacks
@@ -149,15 +149,20 @@ Single `setInterval` at 3 s. Stops when `status === 'completed' | 'error'`. Same
 
 ### Chrome extension structure
 
+Popup-only — there is no content script or page injection (the manifest has no `content_scripts` and no `arxiv.org` host permission). The user always drives conversion from the toolbar popup. `build.js` (esbuild) bundles only the two entry points below.
+
 - `background/service-worker.ts` — runs polling, owns the `activeJob` state, broadcasts `CONVERSION_PROGRESS|COMPLETE|ERROR` to all tabs
-- `content/content.ts` — injected on `arxiv.org/abs/*` pages only; renders the floating "翻訳" button
 - `popup/popup.tsx` — toolbar popup; on open, calls `GET_STATUS` on the service worker to resume in-progress jobs
 
 The extension stores `apiUrl` and `lastCompletedJob` in `chrome.storage.local`. `download_url` from the status response (presigned S3 URL in prod, local `/download` path in dev) is used directly for the download — do not reconstruct it.
 
 ## Design principles
 
-Follow **SOLID, YAGNI, KISS, DRY, SoC**. These aren't decorations — they map to concrete rules below. When in doubt, prefer the simpler option and call it out.
+**Think before coding.** Don't assume — state your assumptions, surface tradeoffs, and ask when the request is ambiguous rather than silently picking one interpretation and running with it. If a simpler approach exists, say so and push back. If something is unclear, stop, name what's confusing, and ask.
+
+**Goal-driven execution.** Turn the task into a verifiable goal before writing code: "add validation" → write tests for the invalid inputs, then make them pass; "fix the bug" → write a failing test that reproduces it first; "refactor X" → confirm tests pass before and after. For multi-step work, state a short plan with a per-step verification, then loop until the checks hold. The strict ruff/mypy gates and the `tests/eval/` scripts are the success criteria — lean on them.
+
+For code structure, follow **SOLID, YAGNI, KISS, DRY, SoC**. These aren't decorations — they map to concrete rules below. When in doubt, prefer the simpler option and call it out.
 
 - **YAGNI** — Do not add config flags, abstract base classes, plugin hooks, or "for future use" parameters. If a need is one paper away, don't build the framework now. Recent removals along this axis: the `SequentialAgent` / `TexFetchAgent` / `create_orchestrator_agent()`, and the `Tex2MarkdownAgent` (replaced by a pandoc subprocess once we realised a deterministic transform handled every case the LLM was doing).
 - **KISS** — Prefer a flat function over a class hierarchy. Prefer one file over five. `run_pipeline()` is intentionally a linear async function, not a state machine. When a deterministic library transform (markdownify, pandoc) replaces an LLM, take that trade — fewer calls, lower cost, more consistent output.
@@ -179,6 +184,7 @@ When a change tempts you to break one of these (e.g., "I'll just import `boto3` 
 
 ## Conventions to keep
 
+- **Surgical changes** — Every changed line should trace to the request. Don't reformat, rename, or "improve" adjacent code, comments, or imports you weren't asked to touch, and match the surrounding style even where you'd do it differently. Remove only the imports/variables/functions *your* change orphaned; if you notice pre-existing dead code, mention it — don't delete it.
 - **Ruff**: line length 120, target py312, rule set `E F I N W UP B A SIM`. Run `ruff check` before committing.
 - **Mypy**: strict mode is on. New code must type-check.
 - **Pytest**: `asyncio_mode = "auto"` — async tests don't need `@pytest.mark.asyncio`.
