@@ -254,8 +254,11 @@ async def _publish_progress(
 async def _check_cancelled(job_manager: JobManager | None, job_id: str) -> None:
     """Abort the pipeline if the API has requested cancellation.
 
-    Polled at each stage boundary. We can't interrupt an in-flight LLM stream,
-    so cancellation latency is at most one stage — but never mid-stage.
+    Polled at each stage boundary, so a cancel requested during a non-LLM
+    stage (fetch, tex2markdown, packaging) is observed when that stage ends.
+    Cancellation *during* an LLM stage is handled separately by
+    ``_run_single_agent``, which races the call against a cancel poller and
+    tears it down within ``_CANCEL_POLL_INTERVAL_SECONDS``.
     """
     if job_manager is None:
         return

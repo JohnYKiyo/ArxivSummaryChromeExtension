@@ -88,9 +88,9 @@ The conversion pipeline is a linear async function — **not** an ADK `Sequentia
 `run_pipeline()` in `orchestrator.py` is the single source of truth:
 
 ```
-fetch_arxiv_paper (src/tools/arxiv.py)
-  ├ kind="html" → html_to_markdown   (src/tools/html_to_markdown.py — markdownify)
-  └ kind="tex"  → tex_to_markdown    (src/tools/tex_to_markdown.py  — pandoc subprocess)
+fetch_arxiv_paper (src/tools/arxiv.py — TeX e-print only)
+                              ↓
+                  tex_to_markdown    (src/tools/tex_to_markdown.py  — pandoc subprocess)
                               ↓
                   TranslationAgent   (src/agents/translation.py — LLM)
                               ↓
@@ -101,15 +101,15 @@ fetch_arxiv_paper (src/tools/arxiv.py)
                   upload_to_s3 (prod) OR keep local (dev)
 ```
 
-Source → Markdown is **deterministic** (library, no LLM): `markdownify` for HTML, `pandoc` for TeX. Only translation and summary call the LLM. Each LLM agent runs via an ephemeral `InMemoryRunner` inside `_run_single_agent()`; progress is reported via `JobManager.update_progress()` between stages using the `STAGES` table at the top of `orchestrator.py`.
+Source → Markdown is **deterministic** (library, no LLM): `pandoc` converts the TeX e-print. (An HTML→Markdown path via `markdownify` lives in `tools/html_to_markdown.py` but is **currently disabled** — LaTeXML's HTML leaked preamble/citation residue, so `fetch_arxiv_paper` always returns `kind="tex"`.) Only translation and summary call the LLM. Each LLM agent runs via an ephemeral `InMemoryRunner` inside `_run_single_agent()`; progress is reported via `JobManager.update_progress()` between stages using the `STAGES` table at the top of `orchestrator.py`.
 
 ### Source fetching (`backend/src/tools/arxiv.py`)
 
-`fetch_arxiv_paper()` returns a `PaperSource` dataclass with `kind: "html" | "tex"`:
+`fetch_arxiv_paper()` returns a `PaperSource` dataclass. `kind` is typed `"html" | "tex"`, but the live path **always returns `kind="tex"`**:
 
-1. **HTML-first** — try `arxiv.org/html/<id>`; if 200 HTML, use it. arxiv's HTML is LaTeXML-generated and converts well via `markdownify` with the `<article class="ltx_document">` selector and ``alttext`` extraction for math.
-2. **TeX fallback** — fetch `arxiv.org/e-print/<id>`. For multi-file submissions, `\input{...}` / `\include{...}` directives are recursively expanded so pandoc operates on a single self-contained document. Main file is picked by preferring files containing both `\documentclass` and `\begin{document}`.
-3. **PDF-only** — when the e-print is a PDF (no real TeX source) or just a `\includepdf` wrapper, raise `PdfOnlyPaperError`. The orchestrator catches this and surfaces a clear Japanese error message to the user.
+1. **TeX e-print** — fetch `arxiv.org/e-print/<id>`. For multi-file submissions, `\input{...}` / `\include{...}` (and `\bibliography{...}` → inlined `.bbl`) directives are recursively expanded so pandoc operates on a single self-contained document. Main file is picked by preferring files containing both `\documentclass` and `\begin{document}`.
+2. **PDF-only** — when the e-print is a PDF (no real TeX source) or just a `\includepdf` wrapper, raise `PdfOnlyPaperError`. The orchestrator catches this and surfaces a clear Japanese error message to the user.
+3. **HTML (disabled)** — `try_fetch_html` / `html_to_markdown` still exist but are **not called** by `fetch_arxiv_paper`. HTML-first was dropped because LaTeXML output leaked preamble commands, inlined `\thanks` into titles, and broke email links; the TeX→pandoc path is cleaner. Don't assume HTML is fetched.
 
 ### Agent output extraction
 
@@ -169,7 +169,7 @@ For code structure, follow **SOLID, YAGNI, KISS, DRY, SoC**. These aren't decora
 - **DRY** — But don't deduplicate things that merely look similar. The polling logic in `useJobPolling.ts` (web) and `service-worker.ts` (extension) is duplicated *on purpose* — they run in different runtimes with different lifecycle constraints. Shared types/constants → extract; shared coincidence → leave alone.
 - **SoC** — Keep the layer boundaries strict:
   - `agents/` = LLM prompt construction + ADK runner glue. Currently `translation`, `summary`, and `orchestrator`. **No** DynamoDB, **no** filesystem, **no** HTTP.
-  - `tools/` = pure I/O and deterministic transforms. `arxiv` (fetch + TeX extraction), `html_to_markdown` (markdownify), `tex_to_markdown` (pandoc), `packaging` (ZIP + S3). **No** LLM calls.
+  - `tools/` = pure I/O and deterministic transforms. `arxiv` (fetch + TeX extraction), `tex_to_markdown` (pandoc), `image_convert` (PDF figure → PNG), `packaging` (ZIP + S3). `html_to_markdown` (markdownify) exists but is currently unused (HTML path disabled). **No** LLM calls.
   - `services/job_manager.py` = the *only* code that talks to DynamoDB.
   - `services/pipeline_dispatcher.py` = the *only* code that decides between Lambda-invoke (prod) and in-process asyncio (dev).
   - `api/routes.py` = HTTP shape only; delegates to `JobManager` and the dispatcher.
