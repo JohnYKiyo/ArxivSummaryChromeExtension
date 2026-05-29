@@ -63,6 +63,7 @@ class JobManager:
                 "message": None,
                 "download_url": None,
                 "error": None,
+                "cancel_requested": False,
                 "ttl": self._make_ttl(),
             }
         )
@@ -96,6 +97,7 @@ class JobManager:
             download_url=item.get("download_url"),
             local_result_path=item.get("local_result_path"),
             error=item.get("error"),
+            cancel_requested=bool(item.get("cancel_requested", False)),
         )
 
     async def update_status(self, job_id: str, status: JobStatus) -> None:
@@ -211,3 +213,77 @@ class JobManager:
             },
         )
         logger.error("Job %s error: %s", job_id, error)
+
+    async def request_cancel(self, job_id: str) -> bool:
+        """Mark a job for cooperative cancellation.
+
+        Sets ``cancel_requested = True`` only when the job is still in a
+        non-terminal state. The running pipeline checks this flag between
+        stages and exits cleanly via :meth:`set_cancelled` when it sees it.
+
+        Status is intentionally NOT flipped here — a progress write from the
+        in-flight pipeline would race-overwrite it back to the current stage.
+        The pipeline owns the eventual CANCELLED transition.
+
+        Args:
+            job_id: The unique job identifier.
+
+        Returns:
+            ``True`` if the cancel flag was set (or was already set).
+            ``False`` if the job has already finished (completed / error /
+            cancelled) — cancellation is a no-op in that case.
+        """
+        # Conditional update: only set the flag when the status is still
+        # in-flight. ``attribute_not_exists`` covers the legacy rows that
+        # predate this attribute.
+        try:
+            self._table.update_item(
+                Key={"job_id": job_id},
+                UpdateExpression="SET cancel_requested = :true, updated_at = :now",
+                ConditionExpression=("#s <> :completed AND #s <> :error AND #s <> :cancelled"),
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":true": True,
+                    ":completed": JobStatus.COMPLETED.value,
+                    ":error": JobStatus.ERROR.value,
+                    ":cancelled": JobStatus.CANCELLED.value,
+                    ":now": datetime.now(UTC).isoformat(),
+                },
+            )
+        except self._table.meta.client.exceptions.ConditionalCheckFailedException:
+            return False
+        logger.info("Job %s cancel requested", job_id)
+        return True
+
+    async def is_cancel_requested(self, job_id: str) -> bool:
+        """Return ``True`` if a cancel has been requested for the job.
+
+        Used by the pipeline orchestrator at each stage boundary to decide
+        whether to abort the run.
+        """
+        response = self._table.get_item(
+            Key={"job_id": job_id},
+            ProjectionExpression="cancel_requested",
+        )
+        item = response.get("Item")
+        if item is None:
+            return False
+        return bool(item.get("cancel_requested", False))
+
+    async def set_cancelled(self, job_id: str) -> None:
+        """Mark a job as cancelled (terminal state).
+
+        Called by the orchestrator after it observes ``cancel_requested``
+        between stages and stops the pipeline.
+        """
+        self._table.update_item(
+            Key={"job_id": job_id},
+            UpdateExpression="SET #s = :status, message = :msg, updated_at = :now",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":status": JobStatus.CANCELLED.value,
+                ":msg": "処理がキャンセルされました",
+                ":now": datetime.now(UTC).isoformat(),
+            },
+        )
+        logger.info("Job %s cancelled", job_id)

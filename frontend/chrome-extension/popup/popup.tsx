@@ -44,6 +44,9 @@ const progressLabel = $<HTMLSpanElement>("progress-label");
 const progressPercent = $<HTMLSpanElement>("progress-percent");
 const progressBar = $<HTMLDivElement>("progress-bar");
 const progressStep = $<HTMLParagraphElement>("progress-step");
+const cancelBtn = $<HTMLButtonElement>("cancel-btn");
+const cancelledSection = $<HTMLDivElement>("cancelled-section");
+const cancelledRetryBtn = $<HTMLButtonElement>("cancelled-retry-btn");
 const downloadSection = $<HTMLDivElement>("download-section");
 const downloadBtn = $<HTMLButtonElement>("download-btn");
 const errorSection = $<HTMLDivElement>("error-section");
@@ -84,11 +87,14 @@ function resetUI(): void {
   hide(progressSection);
   hide(downloadSection);
   hide(errorSection);
+  hide(cancelledSection);
   submitBtn.textContent = "翻訳を開始";
   updateSubmitEnabled();
   progressBar.style.width = "0%";
   progressPercent.textContent = "0%";
   progressStep.textContent = "";
+  cancelBtn.disabled = false;
+  cancelBtn.textContent = "キャンセル";
 }
 
 function showError(msg: string): void {
@@ -200,6 +206,12 @@ async function pollJobStatus(jobId: string): Promise<void> {
       return;
     }
 
+    if (data.status === "cancelled") {
+      stopPolling();
+      onConversionCancelled();
+      return;
+    }
+
     // Still running — update progress UI.
     updateProgress(data);
   } catch (err) {
@@ -223,6 +235,14 @@ function updateProgress(data: StatusResponse): void {
     type: "UPDATE_BADGE",
     text: `${pct}%`,
   });
+}
+
+function onConversionCancelled(): void {
+  hide(progressSection);
+  show(cancelledSection);
+  submitBtn.textContent = "翻訳を開始";
+  updateSubmitEnabled();
+  chrome.runtime.sendMessage({ type: "UPDATE_BADGE", text: "" });
 }
 
 function onConversionComplete(jobId: string, downloadUrl: string | null): void {
@@ -249,6 +269,31 @@ function onConversionComplete(jobId: string, downloadUrl: string | null): void {
 }
 
 // ── Event Handlers ──────────────────────────────────────
+
+async function handleCancel(): Promise<void> {
+  if (!currentJobId) return;
+  // Optimistic disabled state — confirms the click while the SW awaits the
+  // backend. Polling will eventually flip the UI to ``onConversionCancelled``.
+  cancelBtn.disabled = true;
+  cancelBtn.textContent = "キャンセル中...";
+  try {
+    const response = (await chrome.runtime.sendMessage({
+      type: "CANCEL_CONVERSION",
+      jobId: currentJobId,
+    })) as { success: boolean; error?: string };
+    if (!response?.success) {
+      // Roll the button back so the user can retry; surface the error inline.
+      cancelBtn.disabled = false;
+      cancelBtn.textContent = "キャンセル";
+      showError(response?.error || "キャンセルに失敗しました");
+    }
+  } catch (err) {
+    cancelBtn.disabled = false;
+    cancelBtn.textContent = "キャンセル";
+    const message = err instanceof Error ? err.message : "不明なエラー";
+    showError(message);
+  }
+}
 
 async function handleSubmit(): Promise<void> {
   const arxivUrl = urlInput.value.trim();
@@ -379,10 +424,18 @@ async function init(): Promise<void> {
           const pct: number = response.progress ?? 0;
           progressBar.style.width = `${pct}%`;
           progressPercent.textContent = `${pct}%`;
+          if (response.cancelRequested) {
+            // User already clicked cancel in a previous popup session and the
+            // pipeline hasn't acknowledged yet — keep the button greyed out.
+            cancelBtn.disabled = true;
+            cancelBtn.textContent = "キャンセル中...";
+          }
           startPolling(restoredJobId);
         } else if (response.status === "complete") {
           show(progressSection);
           onConversionComplete(restoredJobId, response.downloadUrl ?? null);
+        } else if (response.status === "cancelled") {
+          onConversionCancelled();
         } else if (response.status === "error") {
           showError(response.error || "変換中にエラーが発生しました");
         }
@@ -395,6 +448,13 @@ async function init(): Promise<void> {
   // Event listeners
   submitBtn.addEventListener("click", handleSubmit);
   urlInput.addEventListener("input", handleUrlInput);
+  cancelBtn.addEventListener("click", () => {
+    void handleCancel();
+  });
+  cancelledRetryBtn.addEventListener("click", () => {
+    resetUI();
+    void handleSubmit();
+  });
   retryBtn.addEventListener("click", () => {
     resetUI();
     handleSubmit();

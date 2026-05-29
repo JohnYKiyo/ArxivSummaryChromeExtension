@@ -17,6 +17,8 @@ the same flow.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -38,6 +40,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Seconds between cancel-flag polls while an LLM stage is in flight. The
+# StreamingMode.NONE LLM call is one un-interruptible await, so we poll the
+# DynamoDB cancel flag on this cadence and cancel the consumption task when set.
+_CANCEL_POLL_INTERVAL_SECONDS = 2.0
+
 # ---------------------------------------------------------------------------
 # Pipeline stages used for progress reporting
 # ---------------------------------------------------------------------------
@@ -49,6 +56,14 @@ STAGES = [
     {"name": "summary", "label": "要約生成中...", "progress": 80, "status": JobStatus.SUMMARY},
     {"name": "packaging", "label": "ZIP作成中...", "progress": 95, "status": JobStatus.PACKAGING},
 ]
+
+
+class JobCancelledError(Exception):
+    """Raised when the orchestrator observes ``cancel_requested`` between stages.
+
+    Caught at the top of :func:`run_pipeline` to transition the job to the
+    CANCELLED terminal state without surfacing as a generic pipeline failure.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -100,17 +115,41 @@ async def _extract_final_text_async(event_stream: Any) -> str:
 async def _run_single_agent(
     agent: LlmAgent,
     user_message: str,
+    job_manager: JobManager | None = None,
+    job_id: str | None = None,
+    poll_interval: float = _CANCEL_POLL_INTERVAL_SECONDS,
 ) -> str:
     """Run a single agent with the given message and return its text output.
 
     Creates an ephemeral :class:`InMemoryRunner` and session for the call.
 
+    When ``job_manager`` and ``job_id`` are both given, the run is raced against
+    a poller of :meth:`JobManager.is_cancel_requested`. ADK's
+    ``StreamingMode.NONE`` makes the whole LLM call one un-interruptible
+    ``await``, so the stage-boundary ``_check_cancelled`` checks cannot react to
+    a cancel that arrives mid-call. We run consumption as a task and ``cancel()``
+    it when a cancel is requested — ``CancelledError`` tears down the client's
+    in-flight httpx request — then raise :class:`JobCancelledError`, which
+    :func:`run_pipeline` maps to the CANCELLED terminal state.
+
+    Note: this stops the *client* (fast user-visible cancel + the pipeline is
+    freed so later stages don't run); it does NOT stop Gemini's server-side
+    generation, so that LLM call's token cost may still be billed. Truly halting
+    generation needs ``run_live()`` / BIDI, which is unsuitable here (Flash-only,
+    32k context, audio-first).
+
     Args:
         agent: The agent to execute.
         user_message: The prompt / content to send.
+        job_manager: Optional job manager; enables mid-call cancellation.
+        job_id: Optional job id; enables mid-call cancellation.
+        poll_interval: Seconds between cancel-flag polls.
 
     Returns:
         The agent's final text response.
+
+    Raises:
+        JobCancelledError: If cancellation is observed mid-call.
     """
     runner = InMemoryRunner(agent=agent)
     user_id = "pipeline"
@@ -129,13 +168,61 @@ async def _run_single_agent(
         parts=[genai_types.Part(text=user_message)],
     )
 
-    event_stream = runner.run_async(
-        user_id=user_id,
-        session_id=session_id,
-        new_message=content,
-    )
+    async def _consume() -> str:
+        event_stream = runner.run_async(
+            user_id=user_id,
+            session_id=session_id,
+            new_message=content,
+        )
+        return await _extract_final_text_async(event_stream)
 
-    return await _extract_final_text_async(event_stream)
+    run_task: asyncio.Task[str] = asyncio.create_task(_consume())
+
+    # No job context (local/test/other callers): preserve old behaviour.
+    if job_manager is None or job_id is None:
+        return await run_task
+
+    # Bind non-optional locals: mypy does not propagate the None-narrowing
+    # above into the nested _watch_cancel closure.
+    cancel_manager: JobManager = job_manager
+    cancel_job_id: str = job_id
+
+    async def _watch_cancel() -> None:
+        while not await cancel_manager.is_cancel_requested(cancel_job_id):
+            await asyncio.sleep(poll_interval)
+
+    watch_task: asyncio.Task[None] = asyncio.create_task(_watch_cancel())
+
+    try:
+        done, _pending = await asyncio.wait(
+            {run_task, watch_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except asyncio.CancelledError:
+        # Outer cancel (e.g. the dispatcher task was cancelled) hit our only
+        # suspension point. Tear both children down and re-raise so the outer
+        # cancel is NOT masked by the suppress blocks below.
+        run_task.cancel()
+        watch_task.cancel()
+        for task in (run_task, watch_task):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        raise
+
+    # Work finished first — prefer the real result even if a cancel landed in
+    # the same loop step (both tasks can be in ``done`` under FIRST_COMPLETED).
+    if run_task in done:
+        watch_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watch_task
+        return run_task.result()  # re-raises a genuine LLM error if any
+
+    # Cancel requested: tear down the client's in-flight request and signal the
+    # pipeline. (Gemini may keep generating server-side — see docstring.)
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
+    raise JobCancelledError
 
 
 async def _publish_progress(
@@ -162,6 +249,18 @@ async def _publish_progress(
         )
 
     logger.info("Pipeline [%s] stage=%s progress=%d%%", job_id, stage["name"], stage["progress"])
+
+
+async def _check_cancelled(job_manager: JobManager | None, job_id: str) -> None:
+    """Abort the pipeline if the API has requested cancellation.
+
+    Polled at each stage boundary. We can't interrupt an in-flight LLM stream,
+    so cancellation latency is at most one stage — but never mid-stage.
+    """
+    if job_manager is None:
+        return
+    if await job_manager.is_cancel_requested(job_id):
+        raise JobCancelledError
 
 
 async def run_pipeline(
@@ -204,6 +303,7 @@ async def run_pipeline(
 
     try:
         # ---- Stage 0: Fetch source (TeX e-print) ----
+        await _check_cancelled(job_manager, job_id)
         await _publish_progress(job_manager, job_id, 0)
 
         # Fetch directly — no LLM needed for downloading/extracting files.
@@ -218,30 +318,38 @@ async def run_pipeline(
         # output frequently leaked LaTeX preamble commands, inlined
         # ``\thanks`` blocks into titles, and wrapped emails as broken
         # relative URLs — see arxiv.fetch_arxiv_paper docstring.
+        await _check_cancelled(job_manager, job_id)
         await _publish_progress(job_manager, job_id, 1)
         markdown_en = tex_to_markdown(paper.content, work_dir=paper.work_dir)
         logger.info("TeX → Markdown via pandoc (%d chars)", len(markdown_en))
         results["markdown_en"] = markdown_en
 
         # ---- Stage 2: Translation ----
+        await _check_cancelled(job_manager, job_id)
         await _publish_progress(job_manager, job_id, 2)
         translation_agent = create_translation_agent(model, api_key=api_key)
         markdown_ja = await _run_single_agent(
             translation_agent,
             f"Translate the following English Markdown to Japanese:\n\n{markdown_en}",
+            job_manager=job_manager,
+            job_id=job_id,
         )
         results["markdown_ja"] = markdown_ja
 
         # ---- Stage 3: Summary ----
+        await _check_cancelled(job_manager, job_id)
         await _publish_progress(job_manager, job_id, 3)
         summary_agent = create_summary_agent(model, api_key=api_key)
         summary_ja = await _run_single_agent(
             summary_agent,
             (f"Create a summary for the following paper.\narXiv URL: {arxiv_url}\n\nPaper content:\n{markdown_ja}"),
+            job_manager=job_manager,
+            job_id=job_id,
         )
         results["summary_ja"] = summary_ja
 
         # ---- Stage 4: Packaging ----
+        await _check_cancelled(job_manager, job_id)
         await _publish_progress(job_manager, job_id, 4)
         zip_path = create_zip_package(
             paper_en_md=markdown_en,
@@ -272,6 +380,16 @@ async def run_pipeline(
             await job_manager.set_result(job_id, download_url, local_result_path=local_path)
 
         logger.info("Pipeline [%s] completed successfully", job_id)
+
+    except JobCancelledError:
+        # User-initiated cancellation. The cancel_requested flag was set
+        # via POST /jobs/{id}/cancel; we observed it at a stage boundary.
+        # Transition to the terminal CANCELLED status — this is an expected
+        # flow, not an error, so don't re-raise.
+        logger.info("Pipeline [%s] cancelled by user", job_id)
+        if job_manager is not None:
+            await job_manager.set_cancelled(job_id)
+        return results
 
     except PdfOnlyPaperError as exc:
         # Friendly, actionable message for the common "only-PDF" case.

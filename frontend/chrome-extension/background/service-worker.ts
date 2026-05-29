@@ -33,11 +33,15 @@ const STALE_JOB_THRESHOLD_MS = 24 * 60 * 60 * 1000;
 interface JobState {
   jobId: string;
   arxivUrl: string;
-  status: "processing" | "complete" | "error";
+  status: "processing" | "complete" | "error" | "cancelled";
   progress: number;
   downloadUrl: string | null;
   error: string | null;
   startedAt: number;
+  // True between the moment the user clicks cancel and the moment the
+  // backend acknowledges by flipping status to ``cancelled``. The popup
+  // uses this to grey out the cancel button while the request is in flight.
+  cancelRequested?: boolean;
 }
 
 // In-memory job table. Keyed by ``arxivUrl`` so the popup — which knows
@@ -96,6 +100,7 @@ function recomputeBadge(): void {
     } else if (job.status === "processing") {
       processing += 1;
     }
+    // ``cancelled`` is terminal but quiet — no badge.
   }
   if (hasError) {
     setBadgeText("!");
@@ -209,6 +214,7 @@ function snapshotJob(job: JobState): {
   progress: number;
   downloadUrl: string | null;
   error: string | null;
+  cancelRequested: boolean;
 } {
   return {
     jobId: job.jobId,
@@ -217,6 +223,7 @@ function snapshotJob(job: JobState): {
     progress: job.progress,
     downloadUrl: job.downloadUrl,
     error: job.error,
+    cancelRequested: job.cancelRequested ?? false,
   };
 }
 
@@ -278,6 +285,51 @@ async function startConversion(
 
     return { success: true, jobId };
   } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return { success: false, error: message };
+  }
+}
+
+/** Request cooperative cancellation of an in-flight job.
+ *
+ * Flags the local job snapshot so the popup can grey out its button
+ * immediately, then POSTs to the backend. The pipeline picks the cancel
+ * up at the next stage checkpoint; polling drives the eventual transition
+ * to ``cancelled``.
+ */
+async function cancelConversion(
+  jobId: string
+): Promise<{ success: boolean; error?: string }> {
+  const job = findJobByJobId(jobId);
+  if (!job) {
+    return { success: false, error: "対象のジョブが見つかりません" };
+  }
+  if (job.status !== "processing") {
+    // Already terminal — nothing to cancel. Mirror the backend's 409 semantics
+    // with a clear local error so the popup can show a sensible message.
+    return { success: false, error: "ジョブはすでに完了しています" };
+  }
+
+  job.cancelRequested = true;
+  await persistActiveJobs();
+
+  const apiUrl = await getApiUrl();
+  try {
+    const res = await fetch(`${apiUrl}/api/v1/jobs/${jobId}/cancel`, {
+      method: "POST",
+    });
+    if (!res.ok) {
+      // Roll back the optimistic flag — the backend rejected (likely 409 if
+      // the job finished in between).
+      job.cancelRequested = false;
+      await persistActiveJobs();
+      const text = await res.text();
+      return { success: false, error: `API error (${res.status}): ${text}` };
+    }
+    return { success: true };
+  } catch (err) {
+    job.cancelRequested = false;
+    await persistActiveJobs();
     const message = err instanceof Error ? err.message : "Unknown error";
     return { success: false, error: message };
   }
@@ -346,6 +398,15 @@ async function pollJobStatus(jobId: string, arxivUrl: string): Promise<void> {
       return;
     }
 
+    if (data.status === "cancelled") {
+      stopPolling(jobId);
+      current.status = "cancelled";
+      current.cancelRequested = false;
+      await persistActiveJobs();
+      recomputeBadge();
+      return;
+    }
+
     // Still in progress — update state.
     handleStatusUpdate(data, jobId, arxivUrl);
   } catch (err) {
@@ -401,6 +462,12 @@ chrome.runtime.onMessage.addListener(
       case "START_CONVERSION": {
         const arxivUrl = message.arxivUrl as string;
         startConversion(arxivUrl).then(sendResponse);
+        return true; // async response
+      }
+
+      case "CANCEL_CONVERSION": {
+        const jobId = message.jobId as string;
+        cancelConversion(jobId).then(sendResponse);
         return true; // async response
       }
 

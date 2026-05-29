@@ -17,6 +17,7 @@ const INITIAL_STATE: JobState = {
   progress: 0,
   isComplete: false,
   isError: false,
+  isCancelled: false,
   errorMessage: null,
   downloadUrl: null,
 };
@@ -64,6 +65,16 @@ export function useJobPolling(jobId: string | null): JobState {
             ...prev,
             isError: true,
             errorMessage: status.error ?? "処理中にエラーが発生しました",
+          }));
+          cleanup();
+          return;
+        }
+
+        if (status.status === "cancelled") {
+          setState((prev) => ({
+            ...prev,
+            isCancelled: true,
+            errorMessage: status.message ?? "処理がキャンセルされました",
           }));
           cleanup();
           return;

@@ -16,6 +16,10 @@ class JobStatus(StrEnum):
     PACKAGING = "packaging"
     COMPLETED = "completed"
     ERROR = "error"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_STATUSES: frozenset[JobStatus] = frozenset({JobStatus.COMPLETED, JobStatus.ERROR, JobStatus.CANCELLED})
 
 
 @dataclass
@@ -32,3 +36,8 @@ class Job:
     download_url: str | None = None
     local_result_path: str | None = None  # ローカル開発時のみ使用
     error: str | None = None
+    # Cooperative-cancellation flag. The API sets this via JobManager.request_cancel();
+    # the orchestrator checks it between stages and transitions to CANCELLED when seen.
+    # Kept separate from ``status`` so a pipeline progress write doesn't race-overwrite
+    # the cancel intent.
+    cancel_requested: bool = False
