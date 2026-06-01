@@ -73,7 +73,7 @@ Load `frontend/chrome-extension/dist/` as an unpacked extension in `chrome://ext
 
 ### Infrastructure (AWS CDK, Python)
 ```bash
-cd infrastructure
+cd infrastructure/cdk
 pip install -r requirements.txt
 cdk synth                    # generate CloudFormation
 cdk deploy --all             # deploy all stacks
@@ -88,9 +88,9 @@ The conversion pipeline is a linear async function — **not** an ADK `Sequentia
 `run_pipeline()` in `orchestrator.py` is the single source of truth:
 
 ```
-fetch_arxiv_paper (src/tools/arxiv.py)
-  ├ kind="html" → html_to_markdown   (src/tools/html_to_markdown.py — markdownify)
-  └ kind="tex"  → tex_to_markdown    (src/tools/tex_to_markdown.py  — pandoc subprocess)
+fetch_arxiv_paper (src/tools/arxiv.py — TeX e-print only)
+                              ↓
+                  tex_to_markdown    (src/tools/tex_to_markdown.py  — pandoc subprocess)
                               ↓
                   TranslationAgent   (src/agents/translation.py — LLM)
                               ↓
@@ -101,15 +101,15 @@ fetch_arxiv_paper (src/tools/arxiv.py)
                   upload_to_s3 (prod) OR keep local (dev)
 ```
 
-Source → Markdown is **deterministic** (library, no LLM): `markdownify` for HTML, `pandoc` for TeX. Only translation and summary call the LLM. Each LLM agent runs via an ephemeral `InMemoryRunner` inside `_run_single_agent()`; progress is reported via `JobManager.update_progress()` between stages using the `STAGES` table at the top of `orchestrator.py`.
+Source → Markdown is **deterministic** (library, no LLM): `pandoc` converts the TeX e-print. (An HTML→Markdown path via `markdownify` lives in `tools/html_to_markdown.py` but is **currently disabled** — LaTeXML's HTML leaked preamble/citation residue, so `fetch_arxiv_paper` always returns `kind="tex"`.) Only translation and summary call the LLM. Each LLM agent runs via an ephemeral `InMemoryRunner` inside `_run_single_agent()`; progress is reported via `JobManager.update_progress()` between stages using the `STAGES` table at the top of `orchestrator.py`.
 
 ### Source fetching (`backend/src/tools/arxiv.py`)
 
-`fetch_arxiv_paper()` returns a `PaperSource` dataclass with `kind: "html" | "tex"`:
+`fetch_arxiv_paper()` returns a `PaperSource` dataclass. `kind` is typed `"html" | "tex"`, but the live path **always returns `kind="tex"`**:
 
-1. **HTML-first** — try `arxiv.org/html/<id>`; if 200 HTML, use it. arxiv's HTML is LaTeXML-generated and converts well via `markdownify` with the `<article class="ltx_document">` selector and ``alttext`` extraction for math.
-2. **TeX fallback** — fetch `arxiv.org/e-print/<id>`. For multi-file submissions, `\input{...}` / `\include{...}` directives are recursively expanded so pandoc operates on a single self-contained document. Main file is picked by preferring files containing both `\documentclass` and `\begin{document}`.
-3. **PDF-only** — when the e-print is a PDF (no real TeX source) or just a `\includepdf` wrapper, raise `PdfOnlyPaperError`. The orchestrator catches this and surfaces a clear Japanese error message to the user.
+1. **TeX e-print** — fetch `arxiv.org/e-print/<id>`. For multi-file submissions, `\input{...}` / `\include{...}` (and `\bibliography{...}` → inlined `.bbl`) directives are recursively expanded so pandoc operates on a single self-contained document. Main file is picked by preferring files containing both `\documentclass` and `\begin{document}`.
+2. **PDF-only** — when the e-print is a PDF (no real TeX source) or just a `\includepdf` wrapper, raise `PdfOnlyPaperError`. The orchestrator catches this and surfaces a clear Japanese error message to the user.
+3. **HTML (disabled)** — `try_fetch_html` / `html_to_markdown` still exist but are **not called** by `fetch_arxiv_paper`. HTML-first was dropped because LaTeXML output leaked preamble commands, inlined `\thanks` into titles, and broke email links; the TeX→pandoc path is cleaner. Don't assume HTML is fetched.
 
 ### Agent output extraction
 
@@ -149,22 +149,27 @@ Single `setInterval` at 3 s. Stops when `status === 'completed' | 'error'`. Same
 
 ### Chrome extension structure
 
+Popup-only — there is no content script or page injection (the manifest has no `content_scripts` and no `arxiv.org` host permission). The user always drives conversion from the toolbar popup. `build.js` (esbuild) bundles only the two entry points below.
+
 - `background/service-worker.ts` — runs polling, owns the `activeJob` state, broadcasts `CONVERSION_PROGRESS|COMPLETE|ERROR` to all tabs
-- `content/content.ts` — injected on `arxiv.org/abs/*` pages only; renders the floating "翻訳" button
 - `popup/popup.tsx` — toolbar popup; on open, calls `GET_STATUS` on the service worker to resume in-progress jobs
 
 The extension stores `apiUrl` and `lastCompletedJob` in `chrome.storage.local`. `download_url` from the status response (presigned S3 URL in prod, local `/download` path in dev) is used directly for the download — do not reconstruct it.
 
 ## Design principles
 
-Follow **SOLID, YAGNI, KISS, DRY, SoC**. These aren't decorations — they map to concrete rules below. When in doubt, prefer the simpler option and call it out.
+**Think before coding.** Don't assume — state your assumptions, surface tradeoffs, and ask when the request is ambiguous rather than silently picking one interpretation and running with it. If a simpler approach exists, say so and push back. If something is unclear, stop, name what's confusing, and ask.
+
+**Goal-driven execution.** Turn the task into a verifiable goal before writing code: "add validation" → write tests for the invalid inputs, then make them pass; "fix the bug" → write a failing test that reproduces it first; "refactor X" → confirm tests pass before and after. For multi-step work, state a short plan with a per-step verification, then loop until the checks hold. The strict ruff/mypy gates and the `tests/eval/` scripts are the success criteria — lean on them.
+
+For code structure, follow **SOLID, YAGNI, KISS, DRY, SoC**. These aren't decorations — they map to concrete rules below. When in doubt, prefer the simpler option and call it out.
 
 - **YAGNI** — Do not add config flags, abstract base classes, plugin hooks, or "for future use" parameters. If a need is one paper away, don't build the framework now. Recent removals along this axis: the `SequentialAgent` / `TexFetchAgent` / `create_orchestrator_agent()`, and the `Tex2MarkdownAgent` (replaced by a pandoc subprocess once we realised a deterministic transform handled every case the LLM was doing).
 - **KISS** — Prefer a flat function over a class hierarchy. Prefer one file over five. `run_pipeline()` is intentionally a linear async function, not a state machine. When a deterministic library transform (markdownify, pandoc) replaces an LLM, take that trade — fewer calls, lower cost, more consistent output.
 - **DRY** — But don't deduplicate things that merely look similar. The polling logic in `useJobPolling.ts` (web) and `service-worker.ts` (extension) is duplicated *on purpose* — they run in different runtimes with different lifecycle constraints. Shared types/constants → extract; shared coincidence → leave alone.
 - **SoC** — Keep the layer boundaries strict:
   - `agents/` = LLM prompt construction + ADK runner glue. Currently `translation`, `summary`, and `orchestrator`. **No** DynamoDB, **no** filesystem, **no** HTTP.
-  - `tools/` = pure I/O and deterministic transforms. `arxiv` (fetch + TeX extraction), `html_to_markdown` (markdownify), `tex_to_markdown` (pandoc), `packaging` (ZIP + S3). **No** LLM calls.
+  - `tools/` = pure I/O and deterministic transforms. `arxiv` (fetch + TeX extraction), `tex_to_markdown` (pandoc), `image_convert` (PDF figure → PNG), `packaging` (ZIP + S3). `html_to_markdown` (markdownify) exists but is currently unused (HTML path disabled). **No** LLM calls.
   - `services/job_manager.py` = the *only* code that talks to DynamoDB.
   - `services/pipeline_dispatcher.py` = the *only* code that decides between Lambda-invoke (prod) and in-process asyncio (dev).
   - `api/routes.py` = HTTP shape only; delegates to `JobManager` and the dispatcher.
@@ -179,6 +184,7 @@ When a change tempts you to break one of these (e.g., "I'll just import `boto3` 
 
 ## Conventions to keep
 
+- **Surgical changes** — Every changed line should trace to the request. Don't reformat, rename, or "improve" adjacent code, comments, or imports you weren't asked to touch, and match the surrounding style even where you'd do it differently. Remove only the imports/variables/functions *your* change orphaned; if you notice pre-existing dead code, mention it — don't delete it.
 - **Ruff**: line length 120, target py312, rule set `E F I N W UP B A SIM`. Run `ruff check` before committing.
 - **Mypy**: strict mode is on. New code must type-check.
 - **Pytest**: `asyncio_mode = "auto"` — async tests don't need `@pytest.mark.asyncio`.

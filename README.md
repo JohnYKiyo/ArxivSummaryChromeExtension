@@ -4,8 +4,8 @@ arXiv 論文を日本語に翻訳・要約するサービスです。arXiv の U
 
 ## 機能
 
-- arXiv ソースの自動取得 — `arxiv.org/html/<id>` を優先し、無ければ `arxiv.org/e-print/<id>` を取得
-- 決定的な Markdown 変換（LLM ではなく `markdownify` / `pandoc` を使用。画像・脚注・引用・数式を保持）
+- arXiv ソースの取得 — `arxiv.org/e-print/<id>` から TeX ソースを取得
+- 決定的な Markdown 変換（LLM ではなく `pandoc` を使用。画像・脚注・引用・数式を保持）
 - マルチファイル TeX (`\input` / `\include`) の再帰展開
 - 英語 → 日本語翻訳（Markdown 構造と数式表記を維持）
 - 論文タイプ（通常論文 / サーベイ）に応じたテンプレートで要約生成
@@ -13,7 +13,7 @@ arXiv 論文を日本語に翻訳・要約するサービスです。arXiv の U
 - 処理中のキャンセル — Web UI と Chrome 拡張のどちらからでも、走行中のジョブを停止可能
 - 成果物の ZIP ダウンロード
 
-> **Note**: PDF しか公開されていない論文（TeX/HTML ソースが無いもの）は変換できません。検出すると `PdfOnlyPaperError` を返し、UI に日本語のエラーメッセージを表示します。
+> **Note**: PDF しか公開されていない論文（TeX ソースが無いもの）は変換できません。検出すると `PdfOnlyPaperError` を返し、UI に日本語のエラーメッセージを表示します。
 
 ## アーキテクチャ
 
@@ -30,9 +30,9 @@ arXiv 論文を日本語に翻訳・要約するサービスです。arXiv の U
 `backend/src/agents/orchestrator.py` の `run_pipeline()` が単一のソース・オブ・トゥルースで、以下を直列実行します（各段の終わりに DynamoDB へ進捗を書き込みます）。
 
 ```
-fetch_arxiv_paper        (tools/arxiv.py)
-  ├ kind="html" → html_to_markdown   (tools/html_to_markdown.py, markdownify)
-  └ kind="tex"  → tex_to_markdown    (tools/tex_to_markdown.py, pandoc サブプロセス)
+fetch_arxiv_paper        (tools/arxiv.py, TeX e-print を取得)
+                          ↓
+              tex_to_markdown          (tools/tex_to_markdown.py, pandoc サブプロセス)
                           ↓
               TranslationAgent       (agents/translation.py, LLM)
                           ↓
@@ -43,7 +43,7 @@ fetch_arxiv_paper        (tools/arxiv.py)
               upload_to_s3 (本番) または ローカル保存 (開発)
 ```
 
-ソース → Markdown は LLM を使わない決定的変換です。LLM を呼び出すのは翻訳と要約の 2 段のみ。
+ソース → Markdown は LLM を使わない決定的変換（pandoc）です。LLM を呼び出すのは翻訳と要約の 2 段のみ。以前は `arxiv.org/html/<id>` を優先していましたが、pandoc 経由の TeX の方が出力が安定するため TeX 専用にしています（HTML 変換のコードは残存していますがパイプラインからは未使用）。
 
 ### Lambda 2 段構成（本番）
 
@@ -58,9 +58,10 @@ fetch_arxiv_paper        (tools/arxiv.py)
 
 ### キャンセルは協調式
 
-`POST /api/v1/jobs/{job_id}/cancel` は DynamoDB の `cancel_requested` フラグを立てるだけで、走行中の Lambda やプロセスを直接停止はしません。`run_pipeline()` は各ステージ境界で [`is_cancel_requested`](backend/src/services/job_manager.py) を確認し、検出したら `CANCELLED` 終端状態へクリーンに遷移します。
+`POST /api/v1/jobs/{job_id}/cancel` は DynamoDB の `cancel_requested` フラグを立てるだけで、走行中の Lambda やプロセスを直接停止はしません。`run_pipeline()` は各ステージ境界で [`is_cancel_requested`](backend/src/services/job_manager.py) を確認し、さらに翻訳・要約の LLM 呼び出し中も別タスク（`_run_single_agent`）が約 2 秒間隔でフラグを監視します。検出したら `CANCELLED` 終端状態へクリーンに遷移します。
 
-- レイテンシは最大 1 ステージぶん — 翻訳・要約は LLM ストリーミング中に割り込めないため、その呼び出しが終わるまで待ちます
+- レイテンシは数秒程度 — LLM 実行中でも約 2 秒（`_CANCEL_POLL_INTERVAL_SECONDS`）以内に進行中の HTTP リクエストを破棄して中断します。非 LLM ステージ（取得・Markdown 変換・パッケージング）はステージ境界で停止します
+- ただし中断は**クライアント側のみ** — Gemini のサーバ側生成は止まらないため、その呼び出し分のトークンは課金され得ます（真に停止するには `run_live()` / BIDI が必要だが Flash・32k 制約のため不採用）
 - ステータスと別フラグなので、パイプラインの進捗書き込みでキャンセル意図が上書きされません
 - すでに終端 (`completed` / `error` / `cancelled`) のジョブには 409 を返します（冪等）
 
@@ -139,7 +140,7 @@ npm install && npm run build      # dist/ にバンドル出力
 npm run watch                      # 開発中の自動リビルド
 
 # Infrastructure (AWS CDK)
-cd infrastructure
+cd infrastructure/cdk
 pip install -r requirements.txt
 cdk synth && cdk deploy --all
 ```
@@ -166,7 +167,7 @@ Web UI は **バックエンドの `GOOGLE_API_KEY`** を使って翻訳しま�
    - **API Endpoint**：`http://localhost:8000`（ローカル）/ `https://<API Gateway URL>`（本番）
    - **Google API Key**：拡張機能はリクエストヘッダ (`X-Google-Api-Key`) で毎回送信するため、ここに入れない限り翻訳は開始できません
 4. **「翻訳を開始」** をクリック
-5. 進捗バーで状態確認 → 完了後 **「ダウンロード (ZIP)」** をクリック。処理中に **「キャンセル」** をクリックすれば次のステージ境界で停止します
+5. 進捗バーで状態確認 → 完了後 **「ダウンロード (ZIP)」** をクリック。処理中に **「キャンセル」** をクリックすれば数秒以内（LLM 実行中でも約 2 秒）で停止します
 
 #### 拡張機能の挙動メモ
 
@@ -222,7 +223,7 @@ npm run build
 |---|---|---|
 | POST | `/api/v1/convert` | 変換ジョブを作成。`X-Google-Api-Key` ヘッダ（任意・拡張機能から使用）で API Key を渡せる。202 を即時返却 |
 | GET | `/api/v1/jobs/{job_id}/status` | ジョブの進捗をポーリング。完了時に `download_url` を返す。`progress` は 0–100 の整数。終端ステータスは `completed` / `error` / `cancelled` |
-| POST | `/api/v1/jobs/{job_id}/cancel` | 走行中ジョブのキャンセル要求。次のステージ境界で `cancelled` に遷移する。終端ジョブに対しては 409 |
+| POST | `/api/v1/jobs/{job_id}/cancel` | 走行中ジョブのキャンセル要求。LLM 実行中でも数秒以内に `cancelled` へ遷移（中断はクライアント側のみ・サーバ側生成は継続し得る）。終端ジョブには 409 |
 | GET | `/api/v1/jobs/{job_id}/download` | ZIP ダウンロード。**`S3_BUCKET_NAME` が未設定（ローカル開発）のときのみ有効**。本番では `status` レスポンスの S3 presigned URL を直接使用 |
 | GET | `/api/v1/health` | ヘルスチェック |
 
