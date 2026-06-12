@@ -22,6 +22,7 @@ arXiv 論文を日本語に翻訳・要約するサービスです。arXiv の U
 | | パターン 1: ローカルで動かす | パターン 2: AWS で動かす |
 |---|---|---|
 | 用途 | 開発・お試し | 本番運用 |
+| クライアント | Web UI + Chrome 拡張 | Web UI（CloudFront 配信）のみ — Chrome 拡張は未対応 |
 | 必要なもの | Docker + Google API Key | AWS アカウント + AWS CLI / CDK + Google API Key |
 | ジョブ実行 | API プロセス内（asyncio） | Lambda 2 段構成（非同期 invoke） |
 | ジョブ状態の保存 | DynamoDB Local | DynamoDB |
@@ -109,7 +110,7 @@ curl https://<API Gateway URL>/api/v1/health
 
 Web UI には CloudFront URL でアクセスします。
 
-> **認証について** — CDK デプロイで Cognito User Pool が作成されますが、ログイン UI は現時点では未実装で、ユーザーフローの整備は今後の課題です。
+> **現状の制限（認証まわり）** — 本番 API は `/health` 以外の全エンドポイントで Cognito JWT 認証が必須ですが、クライアント側のログイン実装が未完了のため、**変換をエンドツーエンドに実行できるのは現状パターン 1（ローカル）のみ**です。Web UI は Cognito ログイン UI が未実装、Chrome 拡張はそもそも AWS 接続に未対応（認証なし + `host_permissions` がローカル URL のみ）。ユーザーフローの整備は今後の課題です。
 
 IAM 権限の詳細、Cognito の設定、ログの確認、リソースの削除（`cdk destroy --all`）などは [AWS デプロイガイド](docs/DEPLOY_AWS.md) を参照してください。
 
@@ -117,7 +118,7 @@ IAM 権限の詳細、Cognito の設定、ログの確認、リソースの削�
 
 ### Web UI
 
-1. Web UI を開く — ローカルなら `http://localhost:5173`、AWS なら CloudFront URL
+1. Web UI を開く — `http://localhost:5173`（AWS の CloudFront 版は認証未実装のため、現状は画面表示までで変換は開始できません）
 2. arXiv の URL を入力欄に貼り付ける（例：`https://arxiv.org/abs/2301.00001`）
 3. **「翻訳開始」** をクリック
 4. 進捗バーで各ステージ（ソース取得 → Markdown 変換 → 翻訳 → 要約 → パッケージング）を確認。途中で止めたい場合は **「キャンセル」** をクリック
@@ -127,7 +128,7 @@ Web UI は **バックエンドの `GOOGLE_API_KEY`** を使って翻訳しま�
 
 ### Chrome 拡張機能
 
-Chrome 拡張はローカル・AWS どちらのバックエンドにも接続できます。設定画面の API Endpoint を切り替えるだけです。
+> **接続先について**: 拡張が接続できるのは現状 **ローカルバックエンド（`http://localhost:8000`）のみ** です。AWS の本番 API への接続は未対応です — 本番は Cognito 認証が必須（拡張にログイン機能なし）なうえ、manifest の `host_permissions` にローカル URL しか含まれていないためです。
 
 > **重要**: 現在の拡張はポップアップ専用です。arxiv.org のページ上にボタンが浮かぶ機能（content script）は実装されていません。常にツールバーアイコンから開いて操作します。
 
@@ -150,7 +151,7 @@ npm run build      # dist/ にバンドル出力
 
 1. ツールバーの拡張機能アイコンをクリックしてポップアップを開く
 2. 下部の **「設定」** をクリックして設定パネルを展開し（API Key 未設定の間は自動で開きます）、以下を入力して **保存**：
-   - **API Endpoint**：`http://localhost:8000`（ローカル）/ `https://<API Gateway URL>`（AWS）
+   - **API Endpoint**：`http://localhost:8000`（現状はローカルバックエンドのみ対応）
    - **Google API Key**：拡張機能はリクエストヘッダ (`X-Google-Api-Key`) で毎回送信するため、ここに入れない限り翻訳は開始できません
 
 #### 翻訳の実行
